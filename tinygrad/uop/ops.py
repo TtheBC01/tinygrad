@@ -1321,6 +1321,7 @@ class KernelInfo:
   beam: int = 0
   optimized: bool = False       # the AST has been through the optimizer, skip re-optimization
   kernel: bool = True           # launched by the runtime, not called from another kernel
+  dyn_shared_mem: int = 0       # bytes of dynamic (extern __shared__) shared memory to reserve at launch, for hand-written kernels
   @property
   def function_name(self): return to_function_name(self.name)
 

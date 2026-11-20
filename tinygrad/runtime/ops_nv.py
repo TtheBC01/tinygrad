@@ -257,6 +257,9 @@ class NVProgramData:
             elif sh.name == ".nv.info" and param == 0x12: lcmem = struct.unpack_from("II", data)[1] + 0x240 # EIATTR_MIN_STACK_SIZE
             elif sh.name == ".nv.info" and param == 0x2f: regs = struct.unpack_from("II", data)[1] # EIATTR_REGCOUNT
 
+      # dynamic (extern __shared__) shared memory is placed after the static shared memory
+      if obj.dyn_shared_mem: shmem = round_up(shmem + obj.dyn_shared_mem, 128)
+
       # These reloc types are CUDA-specific: they all want the program's own address, which is only known once the linear links.
       for apply_image_offset, rel_sym_offset, typ, _ in relocs:
         if typ == 2: self.relocs.append((apply_image_offset, rel_sym_offset, dtypes.uint64, 0)) # R_CUDA_64
