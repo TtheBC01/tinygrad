@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.nv import nv_flash_attention
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
@@ -408,6 +409,11 @@ class TransformerBlock(FFNBlock):
       attn = flash_attention(q, assigned_kv.transpose(0, 1), start_pos[0]+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
+    # on NV/CUDA (sm_80+), prefill uses the causal flash attention kernel on the KV cache (None when it doesn't apply)
+    if idx_mask is None and len(start_pos) == 1 and not hasattr(self, 'attn_sinks') and not self.config.sliding_window and \
+       (nv_attn:=nv_flash_attention(q, assigned_kv.transpose(0, 1), start_pos[0]+T)) is not None:
+      nv_attn = nv_attn.transpose(1, 2).reshape(B, T, -1)                              # back to (B,T,D)
+      return self.attn_output(nv_attn if not self.config.attn_output_gate else (nv_attn * gate.sigmoid()))
     assigned_kv = _cache_prefix(assigned_kv, start_pos, T, 3).transpose(0, 1)
     k, v = assigned_kv[0], assigned_kv[1]
     mask = (idx_mask.repeat_interleave(self.config.n_heads // int(idx_mask.shape[1]), dim=1) if idx_mask is not None else

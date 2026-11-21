@@ -1,12 +1,13 @@
-// fp16 GEMM for Ampere (sm_80/86): C[M,N] = op(A) @ op(B), row-major, fp32 accumulate, fp16 output.
+// fp16 (bf16 with BF16=1) GEMM for Ampere (sm_80/86): C[M,N] = op(A) @ op(B), row-major, fp32 accumulate,
+// output in the input dtype (fp32 with OUT_F32=1).
 // A is stored [M][K], or [K][M] with TRANS_A=1 (C = A^T @ ...). B is stored [K][N], or [N][K] with TRANS_B=1 (C = ... @ B^T).
 // The transposed forms are the backward pass: dA = dC @ B^T (TRANS_B), dB = A^T @ dC (TRANS_A), read without transposing first.
 // Block tile BMxBNxBK, warp tile WMxWN, STAGES-deep cp.async pipeline, swizzled shared memory,
 // ldmatrix (+ .trans for B) feeding mma.sync.m16n8k16.
 // Stream-K tail (SK_P > 0): tiles that would leave the last wave partly empty are split along K across all SK_P block slots,
 // and partial sums are merged through a fp32 workspace, so every SM stays busy to the end.
-// The host side (extra/gemm/ampere_gemm.py) prepends #defines for KNAME, M_DIM, N_DIM, K_DIM and the tile config.
-#include <cuda_fp16.h>
+// The host side (tinygrad/llm/kernels/nv.py) prepends #defines for KNAME, M_DIM, N_DIM, K_DIM and the tile config.
+// (nv_common.cuh, with the cp.async / ldmatrix / mma helpers, is prepended by nv.py)
 
 #ifndef BM
 #define BM 128
@@ -35,6 +36,24 @@
 #ifndef TRANS_B
 #define TRANS_B 0
 #endif
+#ifndef OUT_F32
+#define OUT_F32 0
+#endif
+#ifndef BF16
+#define BF16 0
+#endif
+#if BF16
+typedef __nv_bfloat16 in_t;
+#define MMA mma16816_bf16
+#else
+typedef half in_t;
+#define MMA mma16816
+#endif
+#if OUT_F32
+typedef float out_t;
+#else
+typedef in_t out_t;
+#endif
 #ifndef SK_P
 #define SK_P 0  // concurrent block slots on the GPU (SMs x resident blocks per SM); 0 disables stream-K
 #endif
@@ -46,7 +65,7 @@
 #define KK (BK / 16)  // k16 steps per k tile
 
 static_assert(BK == 32, "the K-contiguous swizzle assumes 4 x 16B chunks per row");
-static_assert(BN >= 64 && BM >= 64, "the outer-contiguous swizzle needs >= 8 x 16B chunks per row");
+static_assert((TRANS_B || BN >= 64) && (!TRANS_A || BM >= 64), "the outer-contiguous swizzle needs >= 8 x 16B chunks per row");
 static_assert(NT % 2 == 0, "B fragments are loaded two n8 tiles at a time");
 static_assert((BM * BK / 8) % NTHREADS == 0 && (BK * BN / 8) % NTHREADS == 0, "tile loads must divide evenly");
 static_assert(M_DIM % BM == 0 && N_DIM % BN == 0 && K_DIM % BK == 0, "shape must be a multiple of the tile");
@@ -69,23 +88,6 @@ __device__ __forceinline__ int kc_off(int row, int chunk) { return row * BK + ((
 // outer-contiguous [BK][W] (B, or A with TRANS_A): ldmatrix.trans reads 8 consecutive k-rows at one chunk: XOR chunk with row&7.
 template <int W> __device__ __forceinline__ int oc_off(int row, int chunk) { return row * W + ((chunk ^ (row & 7)) << 3); }
 
-__device__ __forceinline__ void cp_async16(void *smem, const void *gmem) {
-  unsigned s = (unsigned)__cvta_generic_to_shared(smem);
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
-
-__device__ __forceinline__ void ldmatrix_x4(unsigned *r, const half *p) {
-  unsigned s = (unsigned)__cvta_generic_to_shared(p);
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
-}
-__device__ __forceinline__ void ldmatrix_x4_trans(unsigned *r, const half *p) {
-  unsigned s = (unsigned)__cvta_generic_to_shared(p);
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
-}
 __device__ __forceinline__ int ld_acquire(const int *p) {
   int v;
   asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
@@ -103,18 +105,12 @@ __device__ __forceinline__ void tile_coords(int t, int &bm, int &bn) {
 #endif
 }
 
-__device__ __forceinline__ void mma16816(float *c, const unsigned *a, const unsigned *b) {
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
 extern "C" __global__ void __launch_bounds__(NTHREADS)
-KNAME(half *__restrict__ C, const half *__restrict__ A, const half *__restrict__ B, float *__restrict__ ws, int *__restrict__ flags) {
+KNAME(out_t *__restrict__ C, const in_t *__restrict__ A, const in_t *__restrict__ B, float *__restrict__ ws, int *__restrict__ flags) {
   // dynamic shared memory: STAGES*(BM*BK + BK*BN)*2 bytes, reserved by the runtime via KernelInfo.dyn_shared_mem (can exceed 48 KB)
   // ws: SK_WORKERS x BM*BN fp32 partial sums. flags: SK_WORKERS ints, 0 between launches (each one is reset by the worker that reads it)
   extern __shared__ __align__(128) unsigned char smem[];
-  half *As = (half *)smem, *Bs = As + STAGES * BM * BK;
+  in_t *As = (in_t *)smem, *Bs = As + STAGES * BM * BK;
 
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int wm = warp / (BN / WN), wn = warp % (BN / WN);
@@ -123,7 +119,7 @@ KNAME(half *__restrict__ C, const half *__restrict__ A, const half *__restrict__
   unsigned af[2][MT][4], bf[2][NT][2];
 
   auto load_tile = [&](int stage, int kt) {
-    half *as = As + stage * BM * BK, *bs = Bs + stage * BK * BN;
+    in_t *as = As + stage * BM * BK, *bs = Bs + stage * BK * BN;
 #pragma unroll
     for (int i = 0; i < (BM * BK / 8) / NTHREADS; i++) {
 #if TRANS_A  // A stored [K][M]: BK rows of BM
@@ -151,7 +147,7 @@ KNAME(half *__restrict__ C, const half *__restrict__ A, const half *__restrict__
   // (k0-7,n0-7) (k8-15,n0-7) (k0-7,n8-15) (k8-15,n8-15). A K-contiguous stage is read with ldmatrix, an outer-contiguous one
   // with ldmatrix.trans, so both give the fragments mma.sync expects.
   auto load_frags = [&](int buf, int stage, int kk) {
-    const half *as = As + stage * BM * BK, *bs = Bs + stage * BK * BN;
+    const in_t *as = As + stage * BM * BK, *bs = Bs + stage * BK * BN;
 #pragma unroll
     for (int mt = 0; mt < MT; mt++)
 #if TRANS_A
@@ -206,7 +202,7 @@ KNAME(half *__restrict__ C, const half *__restrict__ A, const half *__restrict__
 #pragma unroll
         for (int mt = 0; mt < MT; mt++)
 #pragma unroll
-          for (int nt = 0; nt < NT; nt++) mma16816(acc[mt][nt], af[kk & 1][mt], bf[kk & 1][nt]);
+          for (int nt = 0; nt < NT; nt++) MMA(acc[mt][nt], af[kk & 1][mt], bf[kk & 1][nt]);
       }
     }
     // the last barrier above came after every shared memory read of this call, so a following call can refill the stages
@@ -218,8 +214,16 @@ KNAME(half *__restrict__ C, const half *__restrict__ A, const half *__restrict__
 #pragma unroll
       for (int nt = 0; nt < NT; nt++) {
         int row = bm + wm * WM + mt * 16 + (lane >> 2), col = bn + wn * WN + nt * 8 + (lane & 3) * 2;
+#if OUT_F32
+        *(float2 *)&C[(size_t)row * N_DIM + col] = make_float2(acc[mt][nt][0], acc[mt][nt][1]);
+        *(float2 *)&C[(size_t)(row + 8) * N_DIM + col] = make_float2(acc[mt][nt][2], acc[mt][nt][3]);
+#elif BF16
+        *(__nv_bfloat162 *)&C[(size_t)row * N_DIM + col] = __floats2bfloat162_rn(acc[mt][nt][0], acc[mt][nt][1]);
+        *(__nv_bfloat162 *)&C[(size_t)(row + 8) * N_DIM + col] = __floats2bfloat162_rn(acc[mt][nt][2], acc[mt][nt][3]);
+#else
         *(half2 *)&C[(size_t)row * N_DIM + col] = __floats2half2_rn(acc[mt][nt][0], acc[mt][nt][1]);
         *(half2 *)&C[(size_t)(row + 8) * N_DIM + col] = __floats2half2_rn(acc[mt][nt][2], acc[mt][nt][3]);
+#endif
       }
   };
 

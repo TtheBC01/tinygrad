@@ -6,6 +6,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, unwrap
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
+from tinygrad.llm.kernels.nv import nv_linear
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -104,6 +105,9 @@ class Linear(nn.Linear):
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features // self.groups)))
+    # NV/CUDA (sm_80+): prefill-sized dense fp16 matmuls run on the hand-written tensor core GEMM (tinygrad/llm/kernels/nv.py)
+    if self.groups == 1 and self.ggml_type is None and (nv_out:=nv_linear(x, _view_back(self.weight))) is not None:
+      return nv_out if self.bias is None else nv_out + self.bias
     if self.groups > 1:
       out = (x.unsqueeze(-2) @ self.weight.reshape(self.groups, -1, self.in_features).transpose(-1, -2)).squeeze(-2)
       return out if self.bias is None else out + self.bias.reshape(self.groups, -1)
