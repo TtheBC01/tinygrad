@@ -1,6 +1,6 @@
 import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-from tinygrad.helpers import getenv, DEBUG, prod, TC_OPT, TC_SELECT, TC_MIN_GLOBALS, USE_TC, IMAGE
+from tinygrad.helpers import getenv, DEBUG, prod, all_int, TC_OPT, TC_SELECT, TC_MIN_GLOBALS, USE_TC, IMAGE
 from tinygrad.uop.ops import Ops, UOp, resolve, AxisType
 from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
@@ -25,12 +25,23 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   TC_MIN_GLOBALS -- do not upcast N when it would drop the specified global count
   """
   # NOTE: unless TC_OPT is > 0, we only trigger tensor cores if there's only one reduce axis
-  if USE_TC > 0 and (len(k.axes_of(reduce=True)) == 1 or (TC_OPT.value >= 1)):
-    for axis in range(3):
+  # On NV/CUDA a multi-reduce kernel (a convolution: input channels x kernel window) also gets tensor cores, padding M/N as needed.
+  # The first (M, N, K) choice that applies is often the 3-wide kernel axis as K, padded 3 -> 16, so there every choice is tried
+  # and the one that pads the kernel least wins (on a 3080: 3x3 convs from ~2-6 to ~15-30 TFLOPS without BEAM).
+  n_reduce = len(k.axes_of(reduce=True))
+  conv_tc = USE_TC > 0 and n_reduce > 1 and TC_OPT.value == 0 and k.ren.target.device in {"NV", "CUDA"} and not getenv("NO_CONV_TC")
+  if USE_TC > 0 and (n_reduce == 1 or (TC_OPT.value >= 1) or conv_tc):
+    tc_choices: list[tuple[int, Scheduler, list[UOp]]] = []
+    for axis in range(27 if conv_tc else 3):
       tk = k.copy()
       # check TC first and apply hand-coded opts if successful
-      try: rngs = tk.apply_opt(Opt(OptOps.TC, axis, (TC_SELECT.value, TC_OPT.value, USE_TC.value)))
+      try: rngs = tk.apply_opt(Opt(OptOps.TC, axis, (TC_SELECT.value, 2 if conv_tc else TC_OPT.value, USE_TC.value)))
       except KernelOptError: continue
+      tc_choices.append((axis, tk, rngs))
+      if not conv_tc: break
+    if tc_choices:
+      # conv: least padded work, then the lowest axis. otherwise the first choice that applied
+      _, tk, rngs = min(tc_choices, key=lambda c: (prod(c[1].full_shape) if all_int(c[1].full_shape) else 0, c[0]))
       def split(idx, size, atype): rngs[idx] = tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[idx]), (size, atype)))[0]
       if TC_MIN_GLOBALS: # attempt to upcast M, local N, upcast N, skipping upcast N if we'd end up with too few globals
         if (size:=next(filter(lambda sz: rngs[1].src[0].divides(sz) is not None, [5,4,3,2]), None)) is not None: split(1, size, AxisType.UPCAST)
@@ -41,6 +52,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         for i in [1,0]:
           if (size:=next(filter(lambda sz: rngs[i].src[0].divides(sz) is not None, [5,4,3,2]), None)) is not None: split(i, size, AxisType.UPCAST)
         if (size:=next(filter(lambda sz: rngs[0].src[0].divides(sz) is not None, [4,2]), None)) is not None: split(0, size, AxisType.LOCAL)
+      if conv_tc:  # unroll the small kernel-window reduce axes (3x3), as BEAM does
+        small = [a for a in tk.axes_of(AxisType.WEAK, AxisType.LOOP, reduce=True) if isinstance(tk.full_shape[a], int) and tk.full_shape[a] <= 3]
+        for ax in small[::-1]:
+          try: tk.apply_opt(Opt(OptOps.SPLIT, ax, (0, AxisType.UPCAST)))
+          except KernelOptError: pass
       return tk
 
   # make a copy so it does not mutate the input
@@ -78,12 +94,23 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             return k
 
   # are we grouping? (requires local shape support)
-  if resolve(prod(k.full_shape[i] for i in k.upcastable_dims()) <= (240 if k.ren.target.device == "QCOM" else 2048), False):
-    for axis in k.axes_of(AxisType.WEAK, reduce=True)[:3]:
-      try:
-        k.apply_opt(Opt(OptOps.SPLIT, axis, (16, AxisType.LOCAL, True)))
-        break
-      except KernelOptError: pass
+  # A reduce over a contiguous (stride 1) axis, as in row-wise or full-tensor reductions, gets a warp per output reading interleaved
+  # elements so the loads coalesce; that pays off up to many outputs (on NV, ~3x on a 4096x4096 row sum). Otherwise (e.g. a column
+  # sum, where one thread per output already reads coalesced memory) group only when there are too few outputs to fill the device.
+  # The warp's partial sums are combined by every lane, so short rows (< 16 elements per lane) aren't worth it.
+  def contiguous(axis:int) -> bool: return any(c is k.rngs[axis] for b in k.bufs for c in b.src[1].get_idx().split_uop(Ops.ADD))
+  n_out = prod(k.full_shape[i] for i in k.upcastable_dims())
+  group_axes = [a for a in k.axes_of(AxisType.WEAK, reduce=True)[:3]
+                if contiguous(a) and resolve(k.full_shape[a] >= 512, False)] if k.ren.target.device in {"NV", "CUDA"} else []
+  if group_axes and resolve(n_out <= 65536, False): group_opts = [(a, (32, AxisType.LOCAL, False)) for a in group_axes]
+  elif resolve(n_out <= (240 if k.ren.target.device == "QCOM" else 2048), False):
+    group_opts = [(a, (16, AxisType.LOCAL, True)) for a in k.axes_of(AxisType.WEAK, reduce=True)[:3]]
+  else: group_opts = []
+  for axis, arg in group_opts:
+    try:
+      k.apply_opt(Opt(OptOps.SPLIT, axis, arg))
+      break
+    except KernelOptError: pass
 
   # no more opt if we are grouping
   if k.group_for_reduces: return k
@@ -170,13 +197,16 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         opts[0] = axis, max(x for x in range(1, min(int(k.full_shape[axis]), 128 * sz // workgroup) + 1) if int(k.full_shape[axis]) % x == 0)
       for axis, sz in opts: k.apply_opt(Opt(OptOps.SPLIT, axis, (sz, AxisType.LOCAL)))
     else:
-      # prioritize making expand axes local
+      # prioritize making expand axes local. A symbolic axis (e.g. a token count times a hidden size) can be split by any factor
+      # that always divides it; without this its kernel runs one thread per workgroup.
+      def divides(axis:int, x:int) -> bool:
+        return k.full_shape[axis] % x == 0 if k.rngs[axis].src[0].op is Ops.CONST else k.rngs[axis].src[0].divides(x) is not None
       local_axis_ranking = [(any(k.rngs[axis] not in b.src[1].get_idx().backward_slice for b in k.bufs), axis) \
-                              for axis in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False) if k.rngs[axis].src[0].op is Ops.CONST]
+                              for axis in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False)]
       to_local: list[tuple[UOp, int]] = []
       for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
         local_size = prod(sz for _, sz in to_local)
-        local_sz: int|None = next((x for x in ([32] * (axis == 0) + [16,8,4,3,2]) if k.full_shape[axis] % x == 0 and local_size * x <= 128), None)
+        local_sz: int|None = next((x for x in ([32] * (axis == 0) + [16,8,4,3,2]) if divides(axis, x) and local_size * x <= 128), None)
         if local_sz is not None: to_local.append((k.rngs[axis], local_sz))
       for rng, local_sz in sorted(to_local[:3], key=lambda x: k.rngs.index(x[0])):
         k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(rng), (local_sz, AxisType.LOCAL)))
