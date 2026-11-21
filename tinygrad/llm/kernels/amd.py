@@ -6,7 +6,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, unwrap
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
-from tinygrad.llm.kernels.nv import nv_linear, nv_quant_gemv, nv_dequant, nv_gemm_supported, NV_QUANT_UNIT, QuantSeg, Glu
+from tinygrad.llm.kernels.nv import nv_linear, nv_quant_gemv, nv_dequant, nv_gemm_supported, nv_note_rmsnorm, NV_QUANT_UNIT, QuantSeg, Glu
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -143,6 +143,14 @@ class Linear(nn.Linear):
       out = (x.unsqueeze(-2) @ self.weight.reshape(self.groups, -1, self.in_features).transpose(-1, -2)).squeeze(-2)
       return out if self.bias is None else out + self.bias.reshape(self.groups, -1)
     return super().__call__(x)
+
+class RMSNorm(nn.RMSNorm):
+  """nn.RMSNorm. On NV/CUDA, a GGUF quant GEMV of its output (decode) applies the norm itself while quantizing the activations, so
+  the norm's own kernels don't run."""
+  def __call__(self, x:Tensor) -> Tensor:
+    out = super().__call__(x)
+    if self.weight is not None and nv_gemm_supported(x.device): nv_note_rmsnorm(out, x, self.weight, self.eps)
+    return out
 
 def _nv_fused(x:Tensor, lins:Sequence[Linear]) -> tuple[Tensor, bool]|None:
   """(x @ concat(weights).T, decode) for Linears that share x and whose weights are GGUF Q4_K/Q6_K/Q8_0 blocks, as one NV kernel:

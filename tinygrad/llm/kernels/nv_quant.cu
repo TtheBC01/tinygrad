@@ -12,15 +12,40 @@
 // grid (NTOK * K / 128), 128 threads: one warp per block of 32 values. X: [NTOK][K] fp32 -> XQ: [NTOK][XWORDS]
 // With GLU, X is a fused gate/up GEMV's output [NTOK][2K] and the values are the gated activation (model.gated_activation)
 // g * sigmoid(GLU_ALPHA g) * (u + GLU_UP_BIAS), g and u first clamped when GLU_LIMIT is defined.
-extern "C" __global__ void __launch_bounds__(128) KNAME(int *__restrict__ XQ, const float *__restrict__ X) {
+// With NORM, X ([NTOK][K] XTYPE) is the input of an RMSNorm with weight NW ([K] WTYPE) and the values are its output,
+// x * rsqrt(mean(x^2) + NORM_EPS) * WLOAD(w) (WLOAD can round w as the model's weight dtype): each block sums its token's squares
+// itself (re-reading the row from L2).
+#ifndef XTYPE
+#define XTYPE float
+#endif
+#ifdef NORM
+#define NORM_PARAM , const WTYPE *__restrict__ NW
+#ifndef WLOAD
+#define WLOAD(w) ((float)(w))
+#endif
+#else
+#define NORM_PARAM
+#endif
+extern "C" __global__ void __launch_bounds__(128) KNAME(int *__restrict__ XQ, const XTYPE *__restrict__ X NORM_PARAM) {
   const int g = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;  // global block of 32
-  const int t = g / (K_DIM / 32), b = g % (K_DIM / 32);
+  const int t = g / (K_DIM / 32), b = g % (K_DIM / 32);  // K % 128 == 0: the block's 4 warps share t
 #ifdef GLU
   float gt = X[(size_t)t * 2 * K_DIM + b * 32 + lane], up = X[(size_t)t * 2 * K_DIM + K_DIM + b * 32 + lane];
 #ifdef GLU_LIMIT
   gt = fminf(gt, GLU_LIMIT), up = fminf(fmaxf(up, -GLU_LIMIT), GLU_LIMIT);
 #endif
   const float v = gt / (1.0f + __expf(-GLU_ALPHA * gt)) * (up + GLU_UP_BIAS);
+#elif defined(NORM)
+  const XTYPE *xr = X + (size_t)t * K_DIM;
+  float ss = 0.0f;
+#pragma unroll 4
+  for (int i = threadIdx.x; i < K_DIM; i += 128) { const float a = (float)xr[i]; ss += a * a; }
+#pragma unroll
+  for (int off = 16; off; off >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, off);
+  __shared__ float wss[4];
+  if (lane == 0) wss[threadIdx.x >> 5] = ss;
+  __syncthreads();
+  const float v = (float)xr[b * 32 + lane] * rsqrtf((wss[0] + wss[1] + wss[2] + wss[3]) / (float)K_DIM + NORM_EPS) * WLOAD(NW[b * 32 + lane]);
 #else
   const float v = X[(size_t)t * K_DIM + b * 32 + lane];
 #endif

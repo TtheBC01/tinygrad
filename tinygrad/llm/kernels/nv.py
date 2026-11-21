@@ -330,8 +330,12 @@ def _seg_source(segs:tuple[tuple[int, int], ...], stage:str, ksplit:int) -> dict
     start, col = end, col + n
   return {"SEG_PARAMS": params, "SEG_DISPATCH": " else ".join(calls)}
 
+_CTYPE = {dtypes.float32: "float", dtypes.half: "half"}
+# an RMSNorm folded into the activation quantization: (eps, input dtype, weight dtype as stored, weight dtype the model uses)
+Norm = tuple[float, DType, DType, DType]
+
 def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, segs:tuple[tuple[int, int], ...]=(), ksplit:int=1,
-                   glu:Glu|None=None) -> UOp:
+                   glu:Glu|None=None, norm:Norm|None=None) -> UOp:
   qts, ns, ntot = "x".join(str(q) for q, _ in segs), "x".join(str(n) for _, n in segs), sum(n for _, n in segs)
   wbytes = int(sum(n * k * NV_QUANT_BYTES[q] for q, n in segs))
   if stage == "DEQUANT":
@@ -346,9 +350,14 @@ def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, segs:tuple[tu
       name += "_glu" + ("" if glu == (1.0, None, 0.0) else hashlib.md5(repr(glu).encode()).hexdigest()[:6])
       defines.update({"GLU": 1, "GLU_ALPHA": f"{alpha!r}f", "GLU_UP_BIAS": f"{up_bias!r}f"})
       if limit is not None: defines["GLU_LIMIT"] = f"{limit!r}f"
+    if norm is not None:
+      eps, xdt, wdt, wuse = norm
+      name += "_norm" + hashlib.md5(repr(norm).encode()).hexdigest()[:6]
+      defines.update({"NORM": 1, "NORM_EPS": f"{eps!r}f", "XTYPE": _CTYPE[xdt], "WTYPE": _CTYPE[wdt]})
+      if wuse != wdt and wuse == dtypes.half: defines["WLOAD(w)"] = "__half2float(__float2half_rn((float)(w)))"
     dims = (UOp.special(128, "lidx0"), UOp.special(ntok * k // 128, "gidx0"))
-    io = ntok * k * (4 * (2 if glu else 1) + 1)
-    est = Estimates(ops=(10 if glu else 3) * ntok * k, lds=io, mem=io)
+    io = ntok * k * (4 * (2 if glu else 1) + 1) + (k * 4 if norm else 0)
+    est = Estimates(ops=(10 if glu else 6 if norm else 3) * ntok * k, lds=io, mem=io)
   else:
     name = f"nv_q{qts}_gemv_{ntok}_{ns}_{k}_ks{ksplit}"
     defines = {"GEMV": 1, "N_OUT": ntot, "NTOK": ntok, "KSPLIT": ksplit, **_seg_source(segs, stage, ksplit)}
@@ -393,14 +402,35 @@ def nv_dequant(segs:Sequence[QuantSeg], in_features:int, dep:Tensor) -> Tensor|N
   fxn = functools.partial(_quant_program, stage="DEQUANT", k=K, ntok=0, segs=tuple((q, n) for _, q, n in segs))
   return Tensor.custom_kernel(Tensor.empty(N, K, dtype=dtypes.half, device=dep.device), *(p for p, _, _ in segs), dep, fxn=fxn)[0]
 
+_NORM_SRC:dict[UOp, tuple[Tensor, Tensor, float]] = {}
+def nv_note_rmsnorm(out:Tensor, x:Tensor, weight:Tensor, eps:float):
+  """Record that out is RMSNorm(x) (x * rsqrt(mean(x^2) + eps) * weight over the last axis): a quant GEMV of out then quantizes
+  from x and applies the norm in the same kernel, so the norm's own kernels never run (out isn't used). Keeps a few entries."""
+  if len(_NORM_SRC) >= 8: _NORM_SRC.pop(next(iter(_NORM_SRC)))
+  _NORM_SRC[out.uop] = (x, weight, eps)
+
+def _norm_src(x:Tensor, K:int) -> tuple[Tensor, Tensor, Tensor, float]|None:
+  # (norm input, norm weight, the weight as stored, eps) when x is a recorded RMSNorm the quantize kernel can apply
+  if (src:=_NORM_SRC.get(x.uop)) is None: return None
+  nx, w, eps = src
+  if nx.shape != x.shape or w.shape != (K,) or nx.dtype not in _CTYPE or w.dtype not in _CTYPE: return None
+  if nx.uop.axis is not None or w.uop.axis is not None or not nx.device == w.device == x.device: return None
+  # a GGUF norm weight is fp32 cast to the model's dtype: read the fp32 buffer and round in the kernel (no cast kernel per call)
+  stored = Tensor(w.uop.src[0]) if w.uop.op is Ops.CAST and w.uop.src[0].dtype in _CTYPE else w
+  return nx, w, stored, eps
+
 _XQ_CACHE:dict[tuple[UOp, Glu|None], Tensor] = {}
 def _quantize_x(x:Tensor, tokens:int, K:int, glu:Glu|None) -> Tensor:
   # int8 activations for the GEMV. Linears that take the same x one after another (when not fused) quantize it once.
   # (A fresh Tensor.empty output per call would make each quantization a distinct kernel.) Keyed on the UOp, a few entries.
   if (xq:=_XQ_CACHE.get(key:=(x.uop, glu))) is not None: return xq
   xq = Tensor.empty(tokens * (K // 4 + K // 16), dtype=dtypes.int32, device=x.device)
-  xq = Tensor.custom_kernel(xq, x.reshape(tokens, x.shape[-1]).float().contiguous(),
-                            fxn=functools.partial(_quant_program, stage="QUANTIZE", k=K, ntok=tokens, glu=glu))[0]
+  fxn = functools.partial(_quant_program, stage="QUANTIZE", k=K, ntok=tokens, glu=glu)
+  if glu is None and not getenv("DISABLE_NV_NORM_FUSE") and (src:=_norm_src(x, K)) is not None:
+    nx, w, stored, eps = src
+    xq = Tensor.custom_kernel(xq, nx.reshape(tokens, K).contiguous(), stored.contiguous(),
+                              fxn=functools.partial(fxn, norm=(eps, nx.dtype, stored.dtype, w.dtype)))[0]
+  else: xq = Tensor.custom_kernel(xq, x.reshape(tokens, x.shape[-1]).float().contiguous(), fxn=fxn)[0]
   if len(_XQ_CACHE) >= 4: _XQ_CACHE.pop(next(iter(_XQ_CACHE)))
   _XQ_CACHE[key] = xq
   return xq

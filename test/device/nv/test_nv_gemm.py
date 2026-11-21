@@ -292,6 +292,34 @@ class TestNVQuant(unittest.TestCase):
           out = glu_ffn(Tensor(x), gate, up, down, act, glu).numpy()
           np.testing.assert_allclose(out, ref, atol=0.02 * np.abs(ref).max(), rtol=0)
 
+  def test_rmsnorm_fused(self):
+    # q/k/v of an RMSNorm's output: in decode the quantize kernel applies the norm from its input (the norm's own kernels and the
+    # weight's cast never run), with the weight fp32 as stored or fp32 cast to fp16 as the GGUF loader makes it; prefill as before
+    from tinygrad.llm.kernels.amd import RMSNorm, fused_linear
+    from tinygrad.uop.ops import Ops
+    k = 1024
+    lins = self._shared_linears(((Q4_K, 256), (Q6_K, 128), (Q8_0, 64)), k, seed=30)
+    w32 = np.random.default_rng(31).uniform(0.5, 1.5, k).astype(np.float32)
+    for xdt, wcast in ((dtypes.half, True), (dtypes.float32, False), (dtypes.half, False)):
+      norm = RMSNorm(k, eps=1e-5)
+      norm.weight = Tensor(w32).realize().cast(dtypes.half) if wcast else Tensor(w32).realize()
+      wn = norm.weight.float().numpy()
+      for tokens in (1, 3, 32):
+        with self.subTest(xdt=xdt, wcast=wcast, tokens=tokens):
+          x = (np.random.default_rng(32).standard_normal((1, tokens, k)) * 3).astype(np.float32)
+          xt = Tensor(x).cast(xdt).realize()
+          xr = xt.float().numpy()
+          h = xr / np.sqrt((xr * xr).mean(-1, keepdims=True) + 1e-5) * wn
+          if tokens == 1:  # (on its own input: a scheduled but unrun quantize must not be the cached one used below)
+            sched = Tensor.schedule_linear(*fused_linear(norm(Tensor(x).cast(xdt).realize()), *lins))
+            names = [u.src[0].src[0].arg.name for u in sched.src if u.src[0].op is Ops.PROGRAM]
+            self.assertEqual(len(names), 2)  # nothing but the norm-applying quantize and the fused GEMV
+            self.assertTrue(names[0].startswith("nv_q8_quantize_1_1024_norm") and names[1].startswith("nv_q12x14x8_gemv"), names)
+          outs = fused_linear(norm(xt), *lins)
+          for lin, out in zip(lins, outs):
+            ref = h @ lin.weight.float().numpy().T
+            np.testing.assert_allclose(out.float().numpy(), ref, atol=0.015 * np.abs(ref).max(), rtol=0)
+
   def test_unsupported_type(self):
     self.assertIsNone(nv_quant_linear(Tensor.empty(1, 256), Tensor.empty(256 * 84 // 256, dtype=dtypes.uint8), 10, 1, 256))  # Q2_K
 
