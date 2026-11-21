@@ -112,8 +112,26 @@ class TestNVFlashAttention(unittest.TestCase):
                                     (1, 4, 1, 64, 256, 200)):
       with self.subTest(B=B, H=H, KVH=KVH, D=D, T=T, prefix=prefix): self._check(B, H, KVH, D, T, prefix)
 
-  def test_decode_not_used(self):
-    self.assertIsNone(nv_flash_attention(Tensor.empty(1, 8, 1, 64), Tensor.empty(2, 1, 2, 512, 64, dtype=dtypes.half), 10))
+  def test_decode(self):
+    # one query token (flash decoding): KV lengths below, at and above the split count, GQA groups of 1-4, a stale cache tail
+    for B, H, KVH, D, valid_end in ((1, 24, 8, 128, 1025), (1, 24, 8, 128, 3), (2, 8, 2, 64, 300), (1, 8, 8, 64, 1), (1, 32, 8, 64, 4096)):
+      with self.subTest(B=B, H=H, KVH=KVH, D=D, valid_end=valid_end):
+        rng = np.random.default_rng(valid_end + D)
+        q = rng.standard_normal((B, H, 1, D)).astype(np.float32)
+        cache = rng.standard_normal((2, B, KVH, 4096, D)).astype(np.float16)
+        out = nv_flash_attention(Tensor(q), Tensor(cache), valid_end)
+        assert out is not None and out.shape == (B, H, 1, D)
+        np.testing.assert_allclose(out.numpy(), _attention_ref(q, cache, valid_end), atol=3e-3, rtol=1e-2)
+
+  def test_decode_symbolic_jit(self):
+    B, H, KVH, D, N = 1, 24, 8, 128, 2048
+    rng = np.random.default_rng(1)
+    cache = Tensor(rng.standard_normal((2, B, KVH, N, D)).astype(np.float16)).realize()
+    vp = UOp.variable("pos", 0, N - 1)
+    jf = TinyJit(lambda q, pos: nv_flash_attention(q, cache, pos + 1).realize())
+    for pos in (0, 700, 5, 2047):
+      q = rng.standard_normal((B, H, 1, D)).astype(np.float32)
+      np.testing.assert_allclose(jf(Tensor(q), vp.bind(pos)).numpy(), _attention_ref(q, cache.numpy(), pos + 1), atol=3e-3, rtol=1e-2)
 
   def test_symbolic_jit(self):
     # chunked prefill: a symbolic chunk length T at a symbolic position, padded to the static max inside

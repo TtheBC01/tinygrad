@@ -25,6 +25,7 @@ _DIR = pathlib.Path(__file__).parent
 COMMON = (_DIR / "nv_common.cuh").read_text()
 SRC = COMMON + (_DIR / "nv_gemm.cu").read_text()
 FLASH_SRC = COMMON + (_DIR / "nv_flash.cu").read_text()
+DECODE_SRC = COMMON + (_DIR / "nv_decode.cu").read_text()
 
 @dataclass(frozen=True)
 class Cfg:
@@ -236,10 +237,35 @@ def _int_tensor(x:int|UOp) -> Tensor|None:
     return a + b if x.op is Ops.ADD else a * b
   return None
 
+def _decode_program(OUT:UOp, *srcs:UOp, stage:str, nb:int, nh:int, nkv:int, nctx:int, hd:int, nsplit:int) -> UOp:
+  name = f"nv_flash_decode_{stage.lower()}_{nb}_{nh}_{nkv}_{nctx}_{hd}_s{nsplit}"
+  defines = {stage: 1, "KNAME": name, "NB": nb, "NH": nh, "NKV": nkv, "NCTX": nctx, "HD": hd, "NSPLIT": nsplit}
+  src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + DECODE_SRC
+  dims:tuple[UOp, ...] = (UOp.special(128, "lidx0"), UOp.special(nsplit, "gidx0"), UOp.special(nb * nkv, "gidx1")) if stage == "PARTIAL" else \
+    (UOp.special(hd, "lidx0"), UOp.special(nb * nh, "gidx0"))
+  # the KV bytes read depend on the runtime length: count the query side only
+  est = Estimates(ops=4 * nb * nh * hd, lds=4 * nb * nh * hd, mem=4 * nb * nh * hd)
+  sink = UOp.sink(OUT.base, *[x.base for x in srcs], *dims, arg=KernelInfo(name, estimates=est))
+  return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src)))
+
+def nv_flash_decode(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp, nsms:int) -> Tensor|None:
+  """One query token per sequence: q (B, H, 1, D) over the fp16 cache's keys [0, valid_end). (B, H, 1, D) fp32, or None."""
+  B, H, _, D = (int(x) for x in q.shape)
+  KVH, NCTX = int(assigned_kv.shape[2]), int(assigned_kv.shape[3])
+  if (end_t:=_int_tensor(valid_end)) is None: return None
+  # enough blocks to fill the GPU a few times over: each streams its share of the keys
+  nsplit = max(1, min(64, -(-4 * nsms // (B * KVH))))
+  def prg(stage:str): return functools.partial(_decode_program, stage=stage, nb=B, nh=H, nkv=KVH, nctx=NCTX, hd=D, nsplit=nsplit)
+  part = Tensor.empty(B * H * nsplit * (D + 2), dtype=dtypes.float32, device=q.device)
+  part = Tensor.custom_kernel(part, q.cast(dtypes.half).contiguous(), assigned_kv, end_t.contiguous(), fxn=prg("PARTIAL"))[0]
+  out = Tensor.invalids(B, 1, H, D, dtype=dtypes.float32, device=q.device)
+  return Tensor.custom_kernel(out, part, fxn=prg("COMBINE"))[0].transpose(1, 2)
+
 def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor|None:
   """Causal attention of q (B, H, T, D) over the fp16 KV cache assigned_kv (2, B, KvH, max_context, D), whose keys [0, valid_end)
   are valid; query t sits at position valid_end - T + t. Returns (B, H, T, D) fp32, or None if the kernel doesn't apply
-  (decode, unsupported device or shapes). A symbolic T is padded to its max, and the padding is sliced off."""
+  (unsupported device or shapes). One token (decode) uses flash decoding. A symbolic T is padded to its max, and the padding is
+  sliced off."""
   if not nv_gemm_supported(q.device) or assigned_kv.dtype != dtypes.half or q.ndim != 4 or assigned_kv.ndim != 5: return None
   if q.uop.axis is not None or assigned_kv.uop.axis is not None: return None
   B, H, T, D = q.shape
@@ -247,8 +273,9 @@ def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tenso
   if not all(isinstance(v, int) for v in (B, H, D, Bk, KVH, NCTX, Dk)): return None
   B, H, D, KVH, NCTX = int(B), int(H), int(D), int(KVH), int(NCTX)
   if B != Bk or D != Dk or H % KVH or D not in (64, 128): return None
+  if isinstance(T, int) and T == 1: return nv_flash_decode(q, assigned_kv, valid_end, num_sms(q.device))
   T_max = q.max_shape[2]
-  if not isinstance(T_max, int) or T_max < 16: return None  # decode stays on tinygrad's kernels
+  if not isinstance(T_max, int) or T_max < 16: return None  # a few tokens (e.g. speculative decode) stay on tinygrad's kernels
   cfg = FlashCfg(WARPS=4 if T_max >= 64 else 2)
   bm = 16 * cfg.WARPS
   if NCTX % cfg.BN or cfg.smem(D) > MAX_SMEM: return None
