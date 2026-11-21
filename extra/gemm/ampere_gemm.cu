@@ -1,4 +1,6 @@
-// fp16 GEMM for Ampere (sm_80/86): C[M,N] = A[M,K] @ B[K,N], row-major, fp32 accumulate, fp16 output.
+// fp16 GEMM for Ampere (sm_80/86): C[M,N] = op(A) @ op(B), row-major, fp32 accumulate, fp16 output.
+// A is stored [M][K], or [K][M] with TRANS_A=1 (C = A^T @ ...). B is stored [K][N], or [N][K] with TRANS_B=1 (C = ... @ B^T).
+// The transposed forms are the backward pass: dA = dC @ B^T (TRANS_B), dB = A^T @ dC (TRANS_A), read without transposing first.
 // Block tile BMxBNxBK, warp tile WMxWN, STAGES-deep cp.async pipeline, swizzled shared memory,
 // ldmatrix (+ .trans for B) feeding mma.sync.m16n8k16.
 // Stream-K tail (SK_P > 0): tiles that would leave the last wave partly empty are split along K across all SK_P block slots,
@@ -27,6 +29,12 @@
 #ifndef GROUP_M
 #define GROUP_M 0
 #endif
+#ifndef TRANS_A
+#define TRANS_A 0
+#endif
+#ifndef TRANS_B
+#define TRANS_B 0
+#endif
 #ifndef SK_P
 #define SK_P 0  // concurrent block slots on the GPU (SMs x resident blocks per SM); 0 disables stream-K
 #endif
@@ -37,8 +45,8 @@
 #define NT (WN / 8)   // n8 tiles per warp
 #define KK (BK / 16)  // k16 steps per k tile
 
-static_assert(BK == 32, "A swizzle assumes 4 x 16B chunks per row");
-static_assert(BN >= 64, "B swizzle needs >= 8 x 16B chunks per row");
+static_assert(BK == 32, "the K-contiguous swizzle assumes 4 x 16B chunks per row");
+static_assert(BN >= 64 && BM >= 64, "the outer-contiguous swizzle needs >= 8 x 16B chunks per row");
 static_assert(NT % 2 == 0, "B fragments are loaded two n8 tiles at a time");
 static_assert((BM * BK / 8) % NTHREADS == 0 && (BK * BN / 8) % NTHREADS == 0, "tile loads must divide evenly");
 static_assert(M_DIM % BM == 0 && N_DIM % BN == 0 && K_DIM % BK == 0, "shape must be a multiple of the tile");
@@ -54,10 +62,12 @@ constexpr long long SK_ITERS = (long long)SK_TILES * KT;
 constexpr int SK_WORKERS = SK_ITERS < SK_P ? (int)SK_ITERS : SK_P;  // (0 when SK_TILES is 0)  // every worker gets at least one K iteration
 constexpr int DP_TILES = TILES - SK_TILES, GEMM_GRID = SK_WORKERS + DP_TILES;
 
-// A stage: [BM][BK] halves. Rows are 64B, so two rows share a 128B bank line: XOR chunk with (row>>1)&3.
-__device__ __forceinline__ int a_off(int row, int chunk) { return row * BK + ((chunk ^ ((row >> 1) & 3)) << 3); }
-// B stage: [BK][BN] halves. ldmatrix.trans reads 8 consecutive k-rows at one n-chunk: XOR chunk with row&7.
-__device__ __forceinline__ int b_off(int row, int chunk) { return row * BN + ((chunk ^ (row & 7)) << 3); }
+// Shared memory stages come in two layouts, picked by how the operand is stored in global memory:
+// K-contiguous [rows][BK] (A, or B with TRANS_B): rows are 64B, so two rows share a 128B bank line: XOR chunk with (row>>1)&3.
+// ldmatrix reads 8 consecutive rows at one k-chunk, which hits 8 distinct 16B bank groups.
+__device__ __forceinline__ int kc_off(int row, int chunk) { return row * BK + ((chunk ^ ((row >> 1) & 3)) << 3); }
+// outer-contiguous [BK][W] (B, or A with TRANS_A): ldmatrix.trans reads 8 consecutive k-rows at one chunk: XOR chunk with row&7.
+template <int W> __device__ __forceinline__ int oc_off(int row, int chunk) { return row * W + ((chunk ^ (row & 7)) << 3); }
 
 __device__ __forceinline__ void cp_async16(void *smem, const void *gmem) {
   unsigned s = (unsigned)__cvta_generic_to_shared(smem);
@@ -114,29 +124,49 @@ KNAME(half *__restrict__ C, const half *__restrict__ A, const half *__restrict__
 
   auto load_tile = [&](int stage, int kt) {
     half *as = As + stage * BM * BK, *bs = Bs + stage * BK * BN;
-    const half *Ag = A + (size_t)bm * K_DIM, *Bg = B + bn;
 #pragma unroll
     for (int i = 0; i < (BM * BK / 8) / NTHREADS; i++) {
+#if TRANS_A  // A stored [K][M]: BK rows of BM
+      int c = tid + i * NTHREADS, row = c / (BM / 8), ch = c % (BM / 8);
+      cp_async16(as + oc_off<BM>(row, ch), A + (size_t)(kt * BK + row) * M_DIM + bm + ch * 8);
+#else        // A stored [M][K]: BM rows of BK
       int c = tid + i * NTHREADS, row = c / (BK / 8), ch = c % (BK / 8);
-      cp_async16(as + a_off(row, ch), Ag + (size_t)row * K_DIM + kt * BK + ch * 8);
+      cp_async16(as + kc_off(row, ch), A + (size_t)(bm + row) * K_DIM + kt * BK + ch * 8);
+#endif
     }
 #pragma unroll
     for (int i = 0; i < (BK * BN / 8) / NTHREADS; i++) {
+#if TRANS_B  // B stored [N][K]: BN rows of BK
+      int c = tid + i * NTHREADS, row = c / (BK / 8), ch = c % (BK / 8);
+      cp_async16(bs + kc_off(row, ch), B + (size_t)(bn + row) * K_DIM + kt * BK + ch * 8);
+#else        // B stored [K][N]: BK rows of BN
       int c = tid + i * NTHREADS, row = c / (BN / 8), ch = c % (BN / 8);
-      cp_async16(bs + b_off(row, ch), Bg + (size_t)(kt * BK + row) * N_DIM + ch * 8);
+      cp_async16(bs + oc_off<BN>(row, ch), B + (size_t)(kt * BK + row) * N_DIM + bn + ch * 8);
+#endif
     }
   };
 
-  // shared -> register fragments for one k16 step of this warp's tile
+  // shared -> register fragments for one k16 step of this warp's tile. Lane group j = lane>>3 addresses 8x8 matrix j:
+  // A fragment matrices are (m0-7,k0-7) (m8-15,k0-7) (m0-7,k8-15) (m8-15,k8-15); a pair of n8 B fragments is
+  // (k0-7,n0-7) (k8-15,n0-7) (k0-7,n8-15) (k8-15,n8-15). A K-contiguous stage is read with ldmatrix, an outer-contiguous one
+  // with ldmatrix.trans, so both give the fragments mma.sync expects.
   auto load_frags = [&](int buf, int stage, int kk) {
     const half *as = As + stage * BM * BK, *bs = Bs + stage * BK * BN;
 #pragma unroll
     for (int mt = 0; mt < MT; mt++)
-      ldmatrix_x4(af[buf][mt], as + a_off(wm * WM + mt * 16 + (lane & 15), kk * 2 + (lane >> 4)));
+#if TRANS_A
+      ldmatrix_x4_trans(af[buf][mt], as + oc_off<BM>(kk * 16 + ((lane >> 4) << 3) + (lane & 7), (wm * WM + mt * 16) / 8 + ((lane >> 3) & 1)));
+#else
+      ldmatrix_x4(af[buf][mt], as + kc_off(wm * WM + mt * 16 + (lane & 15), kk * 2 + (lane >> 4)));
+#endif
 #pragma unroll
     for (int nt = 0; nt < NT; nt += 2) {
       unsigned r[4];
-      ldmatrix_x4_trans(r, bs + b_off(kk * 16 + (lane & 15), (wn * WN + nt * 8) / 8 + (lane >> 4)));
+#if TRANS_B
+      ldmatrix_x4(r, bs + kc_off(wn * WN + nt * 8 + ((lane >> 4) << 3) + (lane & 7), kk * 2 + ((lane >> 3) & 1)));
+#else
+      ldmatrix_x4_trans(r, bs + oc_off<BN>(kk * 16 + (lane & 15), (wn * WN + nt * 8) / 8 + (lane >> 4)));
+#endif
       bf[buf][nt][0] = r[0]; bf[buf][nt][1] = r[1]; bf[buf][nt + 1][0] = r[2]; bf[buf][nt + 1][1] = r[3];
     }
   };

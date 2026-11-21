@@ -4,7 +4,8 @@ Hand-written Ampere fp16 GEMM (extra/gemm/ampere_gemm.cu) plugged into tinygrad 
   from extra.gemm.ampere_gemm import ampere_matmul
   c = ampere_matmul(a, b)          # a: (M,K) half, b: (K,N) half -> (M,N) half, fp32 accumulate
 
-Falls back to a.matmul(b) when the device/dtype/shape isn't supported.
+Falls back to a.matmul(b) when the device/dtype/shape isn't supported. Differentiable: the backward is two more custom GEMMs
+that read B and A transposed in place (TRANS_B / TRANS_A in the kernel).
 With Cfg.SK (default), tiles that would leave the last wave partly empty are split along K across every SM (stream-K),
 which needs a small fp32 workspace and a zeroed flag buffer per call.
 Run as a script for a correctness + speed check: DEV=NV python extra/gemm/ampere_gemm.py
@@ -44,13 +45,15 @@ class Cfg:
 DEFAULT = Cfg()
 MAX_SMEM = 99 * 1024  # per-block shared memory limit on sm_86/sm_89 (sm_80 allows 163 KB)
 
-# Sustained (power capped) benchmarks on a 3080: the big tile with stream-K was the best or tied on every shape tried
+# Sustained (power capped) benchmarks on a 3080: the big tile with stream-K was the best or tied on every K >= 4096 shape
 # (bench/logs/soak_sweep.log); big tiles move less data per FLOP, so the card holds a higher clock under its power limit.
-# Smaller tiles are fallbacks for shapes the big tile doesn't divide.
-AUTO_CFGS = (Cfg(), Cfg(BM=128, WN=32), Cfg(BM=128, BN=64, WN=32))
+# With a short K (fewer k-steps per tile) the per-tile pipeline fill and epilogue show, and two 48 KB blocks per SM that
+# overlap each other's win: 128x128 (4 warps, 3 stages) beat the big tile by 4-15% for K <= 2048 (bench/logs/harness_k_crossover.log,
+# harness_tn_shortk.log). That's the weight gradient in training, where K is the token count.
+BIG, MID, SMALL = Cfg(), Cfg(BM=128, STAGES=3), Cfg(BM=128, BN=64, WN=32)
 
 def auto_cfg(M:int, N:int, K:int) -> Cfg:
-  return next((c for c in AUTO_CFGS if M % c.BM == 0 and N % c.BN == 0 and K % c.BK == 0), DEFAULT)
+  return next((c for c in ((BIG, MID, SMALL) if K >= 4096 else (MID, SMALL)) if M % c.BM == 0 and N % c.BN == 0 and K % c.BK == 0), DEFAULT)
 
 @functools.cache
 def num_sms(device:str) -> int:
@@ -86,23 +89,28 @@ def split(M:int, N:int, K:int, cfg:Cfg, sms:int) -> Split:
   if sk_tiles and tiles / p + SK_OVERHEAD * sk_tiles / p >= -(-tiles // p): return Split(0, 0, 0, tiles)
   return Split(p, sk_tiles, min(sk_tiles * kt, p), tiles - sk_tiles)
 
-def supported(a:Tensor, b:Tensor, cfg:Cfg=DEFAULT) -> bool:
-  if not (isinstance(a.device, str) and a.device.split(":")[0] in {"NV", "CUDA"}): return False
+def _dims(a:Tensor, b:Tensor, ta:bool, tb:bool) -> tuple:
+  # (M, K, K', N) of op(a) @ op(b), where op transposes when the flag is set
+  (M, K), (K2, N) = a.shape[::-1] if ta else a.shape, b.shape[::-1] if tb else b.shape
+  return M, K, K2, N
+
+def supported(a:Tensor, b:Tensor, cfg:Cfg=DEFAULT, ta:bool=False, tb:bool=False) -> bool:
+  if not (isinstance(a.device, str) and a.device.split(":")[0] in {"NV", "CUDA"}) or a.device != b.device: return False
   if a.dtype != dtypes.half or b.dtype != dtypes.half or a.ndim != 2 or b.ndim != 2: return False
   if cfg.smem > MAX_SMEM: return False
-  (M, K), (K2, N) = a.shape, b.shape
+  M, K, K2, N = _dims(a, b, ta, tb)
   return all(isinstance(x, int) for x in (M, K, N)) and K == K2 and M % cfg.BM == 0 and N % cfg.BN == 0 and K % cfg.BK == 0
 
 @functools.cache
-def _source(M:int, N:int, K:int, cfg:Cfg, sk_p:int) -> tuple[str, str]:
-  name = f"ampere_gemm_{M}_{N}_{K}_{cfg}" + (f"{sk_p}" if sk_p else "")
+def _source(M:int, N:int, K:int, cfg:Cfg, sk_p:int, ta:bool, tb:bool) -> tuple[str, str]:
+  name = f"ampere_gemm_{'t' if ta else 'n'}{'t' if tb else 'n'}_{M}_{N}_{K}_{cfg}" + (f"{sk_p}" if sk_p else "")
   defines = dict(KNAME=name, M_DIM=M, N_DIM=N, K_DIM=K, BM=cfg.BM, BN=cfg.BN, BK=cfg.BK, WM=cfg.WM, WN=cfg.WN, STAGES=cfg.STAGES,
-                 GROUP_M=cfg.GROUP_M, SK_P=sk_p)
+                 GROUP_M=cfg.GROUP_M, SK_P=sk_p, TRANS_A=int(ta), TRANS_B=int(tb))
   return name, "".join(f"#define {k} {v}\n" for k, v in defines.items()) + SRC
 
-def _program(C:UOp, A:UOp, B:UOp, WS:UOp, FLAGS:UOp, cfg:Cfg, sp:Split) -> UOp:
-  (M, K), N = A.shape, B.shape[1]
-  name, src = _source(M, N, K, cfg, sp.sk_p)
+def _program(C:UOp, A:UOp, B:UOp, WS:UOp, FLAGS:UOp, cfg:Cfg, sp:Split, ta:bool, tb:bool) -> UOp:
+  (M, N), K = C.shape, (A.shape[0] if ta else A.shape[1])
+  name, src = _source(M, N, K, cfg, sp.sk_p, ta, tb)
   threads, blocks = UOp.special(cfg.threads, "lidx0"), UOp.special(sp.grid, "gidx0")
   est = Estimates(ops=2 * M * N * K, lds=2 * (M * K + K * N + M * N), mem=2 * (M * K + K * N + M * N))
   sink = UOp.sink(C.base, A.base, B.base, WS.base, FLAGS.base, threads, blocks, arg=KernelInfo(name, estimates=est, dyn_shared_mem=cfg.smem))
@@ -117,20 +125,36 @@ def _flags(device:str) -> Tensor:
   return Tensor.zeros(MAX_SK_WORKERS, dtype=dtypes.int32, device=device).contiguous().realize()
 MAX_SK_WORKERS = 4096  # >= SMs x blocks per SM on any GPU this runs on
 
-def ampere_matmul(a:Tensor, b:Tensor, cfg:Cfg|None=None) -> Tensor:
-  """Forward only (no grad_fxn yet). Falls back to a.matmul(b) for unsupported inputs."""
-  if cfg is None and a.ndim == 2 and b.ndim == 2 and all(isinstance(x, int) for x in (*a.shape, b.shape[1])):
-    cfg = auto_cfg(a.shape[0], b.shape[1], a.shape[1])
-  if cfg is None or not supported(a, b, cfg): return a.matmul(b)
+def _grad(dc:UOp, call:UOp, ta:bool, tb:bool) -> tuple:
+  # C = op(A) @ op(B):  d op(A) = dC @ op(B)^T  and  d op(B) = op(A)^T @ dC, transposed back when the operand was.
+  # Every case is another op(x) @ op(y) GEMM on the stored tensors, so nothing is transposed in memory.
+  _, a, b, _, _ = (Tensor(u) for u in call.src[1:])
+  g = Tensor(dc)
+  da = _gemm(b, g, tb, True) if ta else _gemm(g, b, False, not tb)
+  db = _gemm(g, a, True, ta) if tb else _gemm(a, g, not ta, False)
+  return (None, da.uop, db.uop, None, None)
+
+def _gemm(a:Tensor, b:Tensor, ta:bool=False, tb:bool=False, cfg:Cfg|None=None) -> Tensor:
+  """op(a) @ op(b) with the custom kernel (op transposes when ta/tb is set), or tinygrad's matmul if it's unsupported."""
+  if cfg is None and a.ndim == 2 and b.ndim == 2 and all(isinstance(x, int) for x in _dims(a, b, ta, tb)):
+    M, K, _, N = _dims(a, b, ta, tb)
+    cfg = auto_cfg(M, N, K)
+  if cfg is None or not supported(a, b, cfg, ta, tb): return (a.T if ta else a).matmul(b.T if tb else b)
   a, b = a.contiguous(), b.contiguous()
-  (M, K), N = a.shape, b.shape[1]
+  M, K, _, N = _dims(a, b, ta, tb)
   sp = split(M, N, K, cfg, num_sms(a.device) if cfg.SK else 0)
   assert sp.sk_workers <= MAX_SK_WORKERS
   out = Tensor.invalids(M, N, dtype=dtypes.half, device=a.device)
   # stream-K scratch: fp32 partial tiles (one per worker), and the per-device flag buffer (one-element dummy when stream-K is off)
   ws = Tensor.empty(sp.sk_workers * cfg.BM * cfg.BN if sp.sk_workers else 1, dtype=dtypes.float32, device=a.device)
   flags = _flags(a.device) if sp.sk_workers else Tensor.empty(1, dtype=dtypes.int32, device=a.device)
-  return Tensor.custom_kernel(out, a, b, ws, flags, fxn=functools.partial(_program, cfg=cfg, sp=sp))[0]
+  return Tensor.custom_kernel(out, a, b, ws, flags, fxn=functools.partial(_program, cfg=cfg, sp=sp, ta=ta, tb=tb),
+                              grad_fxn=functools.partial(_grad, ta=ta, tb=tb))[0]
+
+def ampere_matmul(a:Tensor, b:Tensor, cfg:Cfg|None=None) -> Tensor:
+  """a @ b. Differentiable: the backward runs as two more custom GEMMs (dA = dC @ B^T, dB = A^T @ dC), each with its own
+  auto config. Falls back to a.matmul(b) for unsupported inputs."""
+  return _gemm(a, b, cfg=cfg)
 
 if __name__ == "__main__":
   import numpy as np
