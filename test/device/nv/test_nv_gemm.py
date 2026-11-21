@@ -2,6 +2,8 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, TinyJit, UOp, dtypes
 from tinygrad.llm.kernels.nv import ampere_matmul, nv_linear, nv_flash_attention, nv_gemm_supported, _gemm, Cfg, BIG, MID, SMALL, ROWS32, ROWS64
+from tinygrad.llm.kernels.nv import nv_quant_linear, Q8_0, Q4_K, Q6_K
+from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear
 
 def _rand(*shape, seed=0): return np.random.default_rng(seed).standard_normal(shape).astype(np.float16)
@@ -145,6 +147,87 @@ class TestNVFlashAttention(unittest.TestCase):
       t, p = vt.bind(T), vp.bind(pos)
       out = jf(Tensor(q)[:, :, :t].contiguous(), p, t).numpy()[:, :, :T]
       np.testing.assert_allclose(out, _attention_ref(q[:, :, :T], cache.numpy(), pos + T), atol=3e-3, rtol=1e-2)
+
+def _quant_blocks(qtype:int, n:int, k:int, seed=0) -> np.ndarray:
+  # random GGUF blocks for an (n, k) weight, with small finite fp16 scales (random bytes elsewhere: every bit pattern is a valid weight)
+  bsz, nbytes = {Q8_0: (32, 34), Q4_K: (256, 144), Q6_K: (256, 210)}[qtype]
+  rng = np.random.default_rng(seed)
+  blocks = rng.integers(0, 256, (n * k // bsz, nbytes), dtype=np.uint8)
+  def put_half(off, lo, hi): blocks[:, off:off+2] = rng.uniform(lo, hi, len(blocks)).astype(np.float16).view(np.uint8).reshape(-1, 2)
+  if qtype == Q8_0: put_half(0, 0.001, 0.01)
+  if qtype == Q4_K:
+    for off in (0, 2): put_half(off, 0.001, 0.01)
+  if qtype == Q6_K: put_half(208, 0.0005, 0.005)
+  return blocks.reshape(-1)
+
+class TestNVQuant(unittest.TestCase):
+  def setUp(self):
+    if not nv_gemm_supported(Tensor.empty(1).device): self.skipTest("NV/CUDA sm_80+ with the CUDA C renderer required")
+
+  def _check(self, qtype, n, k, tokens):
+    raw = _quant_blocks(qtype, n, k)
+    w = ggml_data_to_tensor(Tensor(raw), n * k, qtype).reshape(n, k).numpy()  # tinygrad's reference dequantization
+    x = np.random.default_rng(1).standard_normal((tokens, k)).astype(np.float32)
+    word = dtypes.uint32 if qtype == Q4_K else dtypes.uint16
+    out = nv_quant_linear(Tensor(x), Tensor(raw).bitcast(word).contiguous(), qtype, n, k)
+    assert out is not None
+    ref = x @ w.T
+    # the activations are rounded to int8 per 32 values (~0.4% of each block's max): compare against the output's scale
+    np.testing.assert_allclose(out.numpy(), ref, atol=0.01 * np.abs(ref).max(), rtol=0)
+
+  def test_types_shapes(self):
+    for qtype in (Q8_0, Q4_K, Q6_K):
+      for n, k, tokens in ((512, 2048, 1), (3072, 3072, 1), (1024, 8192, 3), (130, 1024, 8)):
+        with self.subTest(qtype=qtype, n=n, k=k, tokens=tokens): self._check(qtype, n, k, tokens)
+
+  def test_linear_finds_packed(self):
+    # a Linear whose weight is the GGUF dequantization runs the quant kernel for decode and the fp16 GEMM for prefill
+    n, k = 768, 1024
+    for qtype in (Q8_0, Q4_K, Q6_K):
+      with self.subTest(qtype=qtype):
+        raw = _quant_blocks(qtype, n, k, seed=2)
+        lin = Linear(k, n, bias=False)
+        lin.weight = ggml_data_to_tensor(Tensor(raw).realize(), n * k, qtype).reshape(n, k).cast(dtypes.half)
+        assert lin._nv_packed() is not None and lin._nv_packed()[0] == qtype
+        w = lin.weight.float().numpy()
+        for tokens in (1, 64):
+          x = np.random.default_rng(3).standard_normal((1, tokens, k)).astype(np.float32)
+          ref = x @ w.T
+          np.testing.assert_allclose(lin(Tensor(x)).numpy(), ref, atol=0.01 * np.abs(ref).max(), rtol=0)
+
+  def test_rope_permuted_weight(self):
+    # a GGUF q/k projection: the loader permutes the rows for RoPE, the kernel reads the unpermuted blocks and permutes its output
+    from tinygrad.llm.model import permute_rope
+    n, k = 1024, 2048
+    for n_heads, rope_dim in ((16, 64), (8, 128), (16, 32)):  # q (rope over the whole head), k, and partial rope (a head prefix)
+      with self.subTest(n_heads=n_heads, rope_dim=rope_dim):
+        w0 = ggml_data_to_tensor(Tensor(_quant_blocks(Q4_K, n, k, seed=4)).realize(), n * k, Q4_K).reshape(n, k).cast(dtypes.half)
+        lin = Linear(k, n, bias=False)
+        lin.weight, lin.rope_source = permute_rope(w0, n_heads, rope_dim), (w0, n_heads, rope_dim)
+        assert lin._nv_packed() is not None
+        w = lin.weight.float().numpy()
+        for tokens in (1, 32):  # decode GEMV, prefill on the dequantized weight
+          x = np.random.default_rng(5).standard_normal((1, tokens, k)).astype(np.float32)
+          ref = x @ w.T
+          np.testing.assert_allclose(lin(Tensor(x)).numpy(), ref, atol=0.01 * np.abs(ref).max(), rtol=0)
+
+  def test_prefill_dequant_waits_for_input(self):
+    # each layer's fp16 copy of a quant weight is made after the previous layer's GEMM (it waits for the layer's input), so the
+    # copies don't all live at once: two chained layers schedule as dequant, gemm, dequant, gemm
+    from tinygrad.uop.ops import Ops
+    n = k = 1024
+    layers = []
+    for i in range(2):
+      lin = Linear(k, n, bias=False)
+      lin.weight = ggml_data_to_tensor(Tensor(_quant_blocks(Q4_K, n, k, seed=i)).realize(), n * k, Q4_K).reshape(n, k).cast(dtypes.half)
+      layers.append(lin)
+    out = layers[1](layers[0](Tensor.randn(1, 64, k).realize()))
+    names = [u.src[0].src[0].arg.name for u in out.schedule_linear().src if u.src[0].op is Ops.PROGRAM]
+    order = [nm.split("_")[0] + ("_dequant" if "dequant" in nm else "") for nm in names]
+    self.assertEqual(order, ["nv_dequant", "ampere", "nv_dequant", "ampere"])
+
+  def test_unsupported_type(self):
+    self.assertIsNone(nv_quant_linear(Tensor.empty(1, 256), Tensor.empty(256 * 84 // 256, dtype=dtypes.uint8), 10, 1, 256))  # Q2_K
 
 if __name__ == "__main__":
   unittest.main()

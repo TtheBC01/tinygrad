@@ -6,7 +6,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, unwrap
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
-from tinygrad.llm.kernels.nv import nv_linear
+from tinygrad.llm.kernels.nv import nv_linear, nv_quant_linear, nv_dequant, nv_gemm_supported, NV_QUANT_UNIT
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -72,6 +72,9 @@ class Linear(nn.Linear):
   shard_axis:int|None = None
   weight_scale_inv:Tensor|None = None
   weight_block_size:tuple[int, int] = (128, 128)
+  # (w, n_heads, rope_dim) when the weight is model.permute_rope(w, n_heads, rope_dim): a GGUF q/k projection, whose rows the
+  # loader reorders for RoPE. A kernel can read w's packed blocks instead and permute its output the same way.
+  rope_source:tuple[Tensor, int, int]|None = None
   def __init__(self, in_features:int, out_features:int, bias=True, groups:int=1):
     super().__init__(in_features, out_features, bias)
     # groups > 1: x is (..., groups, in_features), group g multiplies the g-th block of out_features//groups weight rows
@@ -81,6 +84,22 @@ class Linear(nn.Linear):
     if (found:=find_packed(decoded, self.in_features)) is None: return
     self.ggml_type, self.weight = found
     self.shard_axis = decoded.uop.axis
+  def _nv_packed(self) -> tuple[int, Tensor]|None:
+    # (ggml type, packed blocks) when the weight is the dequantization of GGUF blocks, found once
+    if not hasattr(self, "_nv_packed_cache"):
+      self._nv_packed_cache = None
+      if self.ggml_type is None and self.weight.uop.axis is None and nv_gemm_supported(self.weight.device) and not getenv("DISABLE_NV_QUANT"):
+        from tinygrad.llm.kernels.amd_gguf import find_packed
+        w = self.weight if self.rope_source is None else self.rope_source[0]
+        self._nv_packed_cache = find_packed(w, self.in_features)
+    return self._nv_packed_cache
+  def _rope_permute_out(self, out:Tensor) -> Tensor:
+    # model.permute_rope on the output features: the same reordering the loader applied to the weight's rows
+    if self.rope_source is None: return out
+    _, n_heads, rope_dim = self.rope_source
+    x = out.reshape(*out.shape[:-1], n_heads, self.out_features // n_heads)
+    prefix = x.shape[-1] - rope_dim
+    return x[..., :prefix].cat(x[..., prefix:].rearrange("... (h two) -> ... (two h)", two=2), dim=-1).reshape(out.shape)
   def __call__(self, x:Tensor) -> Tensor:
     from tinygrad.llm.kernels.amd_gguf import QUANT_SIZES, q8_linear
     if self.weight_scale_inv is not None:
@@ -105,9 +124,17 @@ class Linear(nn.Linear):
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features // self.groups)))
-    # NV/CUDA (sm_80+): prefill-sized dense fp16 matmuls run on the hand-written tensor core GEMM (tinygrad/llm/kernels/nv.py)
-    if self.groups == 1 and self.ggml_type is None and (nv_out:=nv_linear(x, _view_back(self.weight))) is not None:
-      return nv_out if self.bias is None else nv_out + self.bias
+    # NV/CUDA (sm_80+, tinygrad/llm/kernels/nv.py): decode on GGUF Q4_K/Q6_K/Q8_0 weights runs a dp4a GEMV on the packed blocks;
+    # prefill-sized matmuls run on the hand-written tensor core GEMM, on dense fp16 weights or Q4_K/Q6_K/Q8_0 ones dequantized
+    # to fp16 right before (other quant types keep tinygrad's matmul, which dequantizes as it reads)
+    if self.groups == 1 and self.ggml_type is None and nv_gemm_supported(self.weight.device):
+      if (packed:=self._nv_packed()) is None: nv_out = nv_linear(x, _view_back(self.weight))
+      elif packed[0] not in NV_QUANT_UNIT: nv_out = None
+      elif (nv_out:=nv_quant_linear(x, packed[1], packed[0], self.out_features, self.in_features)) is None:
+        nv_out = nv_linear(x, self.weight, functools.partial(nv_dequant, packed[1], packed[0], self.out_features, self.in_features))
+      if nv_out is not None:
+        if packed is not None: nv_out = self._rope_permute_out(nv_out)
+        return nv_out if self.bias is None else nv_out + self.bias
     if self.groups > 1:
       out = (x.unsqueeze(-2) @ self.weight.reshape(self.groups, -1, self.in_features).transpose(-1, -2)).squeeze(-2)
       return out if self.bias is None else out + self.bias.reshape(self.groups, -1)

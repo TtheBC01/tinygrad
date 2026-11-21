@@ -1,7 +1,7 @@
 from __future__ import annotations
 import enum, functools, itertools, json, math, pathlib, re
 from dataclasses import dataclass, replace
-from typing import Callable
+from typing import Any, Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import nv_flash_attention
@@ -907,12 +907,15 @@ class Transformer:
                       beta_slow=kv.get(f'{arch}.rope.scaling.yarn_beta_slow', 1.0)) if kv.get(f'{arch}.rope.scaling.type') == 'yarn' else None
 
     # Permute RoPE weights from interleaved to half-split layout.
+    rope_sources:dict[str, tuple[Tensor, int, int]] = {}  # the unpermuted weights: quantized kernels read them and permute their output
     for name in state_dict:
       if kda or '.indexer.' in name: continue
       if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
+        rope_sources[name] = (state_dict[name], n_heads, rope_dim)
         state_dict[name] = permute_rope(state_dict[name], n_heads, rope_dim)
       elif arch == 'llama' and 'attn_k.weight' in name:
-        state_dict[name] = permute_rope(state_dict[name], n_kv_heads, state_dict[name].shape[0]//n_kv_heads)
+        rope_sources[name] = (state_dict[name], n_kv_heads, state_dict[name].shape[0]//n_kv_heads)
+        state_dict[name] = permute_rope(*rope_sources[name])
       elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
         state_dict[name] = permute_rope(state_dict[name], 1, state_dict[name].shape[0]-kv_lora_rank)
     swiglu_oai = arch in ('gpt-oss', 'minimax-m3')
@@ -960,6 +963,10 @@ class Transformer:
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    for name, src in rope_sources.items():
+      mod:Any = model
+      for part in name.split('.')[:-1]: mod = mod[int(part)] if part.isdigit() else getattr(mod, part, None)
+      if isinstance(mod, Linear): mod.rope_source = src
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())

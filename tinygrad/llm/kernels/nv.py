@@ -13,7 +13,7 @@ which needs a small fp32 workspace and a zeroed flag buffer per call.
 Run as a script for a correctness check: DEV=NV python -m tinygrad.llm.kernels.nv
 """
 import ctypes, functools, pathlib
-from typing import Any
+from typing import Any, Callable
 from dataclasses import dataclass
 from tinygrad import Tensor, dtypes, Device, Context
 from tinygrad.dtype import DType
@@ -26,6 +26,7 @@ COMMON = (_DIR / "nv_common.cuh").read_text()
 SRC = COMMON + (_DIR / "nv_gemm.cu").read_text()
 FLASH_SRC = COMMON + (_DIR / "nv_flash.cu").read_text()
 DECODE_SRC = COMMON + (_DIR / "nv_decode.cu").read_text()
+QUANT_SRC = COMMON + (_DIR / "nv_quant.cu").read_text()
 
 @dataclass(frozen=True)
 class Cfg:
@@ -181,10 +182,11 @@ def _gemm(a:Tensor, b:Tensor, ta:bool=False, tb:bool=False, cfg:Cfg|None=None, o
 
 NV_LINEAR_MIN_ROWS = 16  # below this (decode), tinygrad's own GEMV is the right kernel
 
-def nv_linear(x:Tensor, weight:Tensor) -> Tensor|None:
+def nv_linear(x:Tensor, weight:Tensor, dequant:Callable[[Tensor], Tensor|None]|None=None) -> Tensor|None:
   """x @ weight.T for a Linear layer (weight: (out, in) fp16 or bf16), or None if the custom GEMM doesn't apply.
   x may be fp32 (it's cast to the weight dtype for the tensor cores); the result is fp32 then, accumulated in fp32 either way.
-  A symbolic token count is padded to its max so the kernel sees static shapes, and the padding is sliced off."""
+  A symbolic token count is padded to its max so the kernel sees static shapes, and the padding is sliced off.
+  dequant(x2) makes the fp16 weight from quantized blocks instead (weight then only gives the shape), given the GEMM's input."""
   if weight.dtype not in (dtypes.half, dtypes.bfloat16) or weight.ndim != 2 or weight.uop.axis is not None: return None
   if x.dtype not in (weight.dtype, dtypes.float32): return None
   if not nv_gemm_supported(weight.device) or x.device != weight.device: return None
@@ -201,6 +203,9 @@ def nv_linear(x:Tensor, weight:Tensor) -> Tensor|None:
   Mp = -(-M // cfg.BM) * cfg.BM
   x2 = xs.reshape(M, K).cast(weight.dtype)
   if Mp != M: x2 = x2.pad(((0, Mp - M), None))
+  if dequant is not None:
+    if (w:=dequant(x2.contiguous())) is None: return None
+    weight = w
   out = _gemm(x2, weight, tb=True, cfg=cfg, out_dtype=x.dtype)
   if Mp != M: out = out[:M]
   out = out.reshape(*xs.shape[:-1], N)
@@ -287,6 +292,78 @@ def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tenso
   out = Tensor.custom_kernel(out, qp.cast(dtypes.half).contiguous(), assigned_kv, params,
                              fxn=functools.partial(_flash_program, cfg=cfg))[0].transpose(1, 2)
   return out if isinstance(T, int) and T == TQ else out.shrink((None, None, (0, T), None))
+
+# ******** GEMV on GGUF quantized weights (decode) ********
+
+Q8_0, Q4_K, Q6_K = 8, 12, 14  # ggml types
+# K must be a multiple of this: the quant block, and for Q6_K/Q8_0 enough of them for 8-byte aligned rows (the kernel's ld16)
+NV_QUANT_UNIT = {Q8_0: 256, Q4_K: 256, Q6_K: 1024}
+NV_QUANT_BYTES = {Q8_0: 34 / 32, Q4_K: 144 / 256, Q6_K: 210 / 256}  # bytes per weight
+NV_QUANT_STEP = {Q8_0: 512, Q4_K: 1024, Q6_K: 1024}  # weights per warp per loop iteration
+NV_QUANT_ALIGN = {Q8_0: 8, Q4_K: 16, Q6_K: 8}  # byte alignment of the weights the kernel's loads need (Q4_K: 128-bit loads)
+NV_QUANT_MAX_TOKENS = 8  # each warp keeps one accumulator per token; prefill dequantizes to fp16 for the GEMM instead
+
+def _byte_offset(t:Tensor) -> int|None:
+  # offset of t's data in its buffer, in bytes (a GGUF tensor is a view into the whole file's buffer)
+  return None if (view:=t.uop.contiguous_view()) is None else view[1] * view[0].dtype.itemsize
+
+def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, n:int=0, qtype:int=0, ksplit:int=1) -> UOp:
+  if stage == "DEQUANT":
+    name, defines = f"nv_q{qtype}_dequant_{n}_{k}", {"DEQUANT": 1, "QTYPE": qtype}
+    dims = (UOp.special(128, "lidx0"), UOp.special(n * k // 1024, "gidx0"))
+    io = int(n * k * (NV_QUANT_BYTES[qtype] + 2))
+    est = Estimates(ops=3 * n * k, lds=io, mem=io)
+  elif stage == "QUANTIZE":
+    name, defines = f"nv_q8_quantize_{ntok}_{k}", {"QUANTIZE": 1}
+    dims = (UOp.special(128, "lidx0"), UOp.special(ntok * k // 128, "gidx0"))
+    io = ntok * k * (4 + 1)
+    est = Estimates(ops=3 * ntok * k, lds=io, mem=io)
+  else:
+    name, defines = f"nv_q{qtype}_gemv_{ntok}_{n}_{k}_ks{ksplit}", {"GEMV": 1, "QTYPE": qtype, "N_DIM": n, "NTOK": ntok, "KSPLIT": ksplit}
+    dims = (UOp.special(128, "lidx0"), UOp.special(-(-n // (4 // ksplit)), "gidx0"))
+    io = int(n * k * NV_QUANT_BYTES[qtype]) + ntok * (k + 4 * n)
+    est = Estimates(ops=2 * ntok * n * k, lds=io, mem=io)
+  src = "".join(f"#define {kk} {v}\n" for kk, v in {**defines, "KNAME": name, "K_DIM": k}.items()) + QUANT_SRC
+  sink = UOp.sink(OUT.base, *[x.base for x in srcs], *dims, arg=KernelInfo(name, estimates=est))
+  return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src)))
+
+def nv_quant_linear(x:Tensor, packed:Tensor, qtype:int, out_features:int, in_features:int) -> Tensor|None:
+  """x @ W.T for a few tokens, W (out_features, in_features) stored as packed GGUF blocks of type qtype (Q4_K, Q6_K or Q8_0,
+  as find_packed returns them). The result is in x's dtype (accumulated in fp32), or None if the kernel doesn't apply."""
+  if qtype not in NV_QUANT_UNIT or not nv_gemm_supported(x.device) or x.device != packed.device: return None
+  if x.uop.axis is not None or packed.uop.axis is not None or x.shape[-1] != in_features: return None
+  tokens, N, K = prod(x.shape[:-1]), out_features, in_features
+  if not isinstance(tokens, int) or not 1 <= tokens <= NV_QUANT_MAX_TOKENS or K % NV_QUANT_UNIT[qtype] or K % 128: return None
+  if packed.nbytes() != int(N * K * NV_QUANT_BYTES[qtype]): return None
+  if (off:=_byte_offset(packed)) is None or off % NV_QUANT_ALIGN[qtype]: return None
+  # split each row's K over up to 4 warps when there are too few rows to keep every SM streaming (~64 warps per SM: a long row
+  # per warp leaves the SMs idle at the end, bench/quant_bench.py)
+  ksplit = 1
+  while ksplit < 4 and N * ksplit < getenv("NV_QUANT_WARPS_PER_SM", 64) * num_sms(x.device) and K // NV_QUANT_STEP[qtype] >= 2 * ksplit: ksplit *= 2
+  prg = functools.partial(_quant_program, k=K, ntok=tokens)
+  out = Tensor.empty(tokens, N, dtype=dtypes.float32, device=x.device)
+  out = Tensor.custom_kernel(out, packed, _quantize_x(x, tokens, K), fxn=functools.partial(prg, stage="GEMV", n=N, qtype=qtype, ksplit=ksplit))[0]
+  return out.reshape(*x.shape[:-1], N).cast(x.dtype)
+
+def nv_dequant(packed:Tensor, qtype:int, out_features:int, in_features:int, dep:Tensor) -> Tensor|None:
+  """The (out_features, in_features) fp16 weight of packed GGUF blocks (Q4_K, Q6_K or Q8_0), or None if unsupported.
+  The kernel waits for dep (the layer's input, otherwise unused) so each layer's copy is made right before its GEMM."""
+  N, K = out_features, in_features
+  if qtype not in NV_QUANT_UNIT or K % NV_QUANT_UNIT[qtype] or (N * K) % 1024 or packed.nbytes() != int(N * K * NV_QUANT_BYTES[qtype]): return None
+  out = Tensor.empty(N, K, dtype=dtypes.half, device=packed.device)
+  return Tensor.custom_kernel(out, packed, dep, fxn=functools.partial(_quant_program, stage="DEQUANT", k=K, ntok=0, n=N, qtype=qtype))[0]
+
+_XQ_CACHE:dict[UOp, Tensor] = {}
+def _quantize_x(x:Tensor, tokens:int, K:int) -> Tensor:
+  # int8 activations for the GEMV. The q/k/v projections (and gate/up) take the same x one after another: quantize it once.
+  # (A fresh Tensor.empty output per call would make each quantization a distinct kernel.) Keyed on the UOp, a few entries.
+  if (xq:=_XQ_CACHE.get(x.uop)) is not None: return xq
+  xq = Tensor.empty(tokens * (K // 4 + K // 16), dtype=dtypes.int32, device=x.device)
+  xq = Tensor.custom_kernel(xq, x.reshape(tokens, K).float().contiguous(),
+                            fxn=functools.partial(_quant_program, stage="QUANTIZE", k=K, ntok=tokens))[0]
+  if len(_XQ_CACHE) >= 4: _XQ_CACHE.pop(next(iter(_XQ_CACHE)))
+  _XQ_CACHE[x.uop] = xq
+  return xq
 
 def ampere_matmul(a:Tensor, b:Tensor, cfg:Cfg|None=None) -> Tensor:
   """a @ b. Differentiable: the backward runs as two more custom GEMMs (dA = dC @ B^T, dB = A^T @ dC), each with its own
