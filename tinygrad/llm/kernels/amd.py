@@ -6,7 +6,8 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, unwrap
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
-from tinygrad.llm.kernels.nv import nv_linear, nv_quant_gemv, nv_dequant, nv_gemm_supported, nv_note_rmsnorm, NV_QUANT_UNIT, QuantSeg, Glu
+from tinygrad.llm.kernels.nv import nv_linear, nv_quant_gemv, nv_dequant, nv_gemm_supported, nv_note_rmsnorm, NV_QUANT_UNIT, NV_QUANT_MAX_TOKENS
+from tinygrad.llm.kernels.nv import QuantSeg, Glu
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -175,9 +176,32 @@ def fused_linear(x:Tensor, *lins:Linear) -> list[Tensor]:
   if (fused:=_nv_fused(x, lins)) is not None: return _nv_split(fused[0], lins, x.dtype)
   return [l(x) for l in lins]
 
+def _nv_glu_prefill(x:Tensor, gate:Linear, up:Linear, down:Linear, glu:Glu) -> Tensor|None:
+  # prefill: one dequantize writes gate's and up's rows interleaved, the GEMM applies SwiGLU to each (gate, up) column pair as it
+  # stores (fp16, the down GEMM's input as is), then down's dequantize and GEMM (fp32 out). None if it doesn't apply.
+  tokens, H = prod(x.shape[:-1]), gate.out_features
+  if isinstance(tokens, int) and tokens <= NV_QUANT_MAX_TOKENS: return None  # decode: the GEMVs
+  if getenv("DISABLE_NV_GLU_FUSE") or up.out_features != H or down.in_features != H or gate.in_features != up.in_features: return None
+  if any(l.bias is not None or l.rope_source is not None for l in (gate, up)) or down.rope_source is not None: return None
+  if (s0:=gate._nv_quant_seg()) is None or (s1:=up._nv_quant_seg()) is None or (sd:=down._nv_quant_seg()) is None: return None
+  K = gate.in_features
+  # a symbolic token count: run both GEMMs on the padded rows and slice once at the end (slicing the activation and padding it
+  # again for down would copy it)
+  xs = x if isinstance(tokens, int) else x.pad_to(x.max_shape)
+  act = nv_linear(xs, Tensor.empty(2 * H, K, dtype=dtypes.half, device=x.device), functools.partial(nv_dequant, [s0, s1], K, interleave=True),
+                  glu=glu)
+  if act is None: return None
+  out = nv_linear(act, Tensor.empty(down.out_features, H, dtype=dtypes.half, device=x.device), functools.partial(nv_dequant, [sd], H),
+                  out_dtype=x.dtype)
+  if out is None: return None
+  return down._nv_out(out if xs is x else out.shrink(tuple((0, s) for s in (*x.shape[:-1], down.out_features))))
+
 def glu_ffn(x:Tensor, gate:Linear, up:Linear, down:Linear, act:Callable[[Tensor, Tensor], Tensor], glu:Glu|None) -> Tensor:
-  """down(act(gate(x), up(x))). On NV/CUDA with GGUF Q4_K/Q6_K/Q8_0 weights gate and up run as one kernel (fused_linear), and in
-  decode act is applied in down's activation quantization when glu gives its SwiGLU constants (None: act is something else)."""
+  """down(act(gate(x), up(x))). On NV/CUDA with GGUF Q4_K/Q6_K/Q8_0 weights gate and up run as one kernel (fused_linear), and act is
+  applied inside a kernel when glu gives its SwiGLU constants (None: act is something else): in decode in down's activation
+  quantization, in prefill in the gate/up GEMM's epilogue."""
+  if glu is not None and gate.groups == up.groups == down.groups == 1 and nv_gemm_supported(x.device) and \
+     (out:=_nv_glu_prefill(x, gate, up, down, glu)) is not None: return out
   if (fused:=_nv_fused(x, (gate, up))) is None: return down(act(gate(x), up(x)))
   gu, decode = fused
   H = gate.out_features

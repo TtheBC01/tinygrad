@@ -234,7 +234,8 @@ extern "C" __global__ void __launch_bounds__(NWARPS * 32) KNAME(float *__restric
 // Prefill on quant weights: dequantize to fp16 for the tensor core GEMM. DEP is the layer's input, unused: it makes this kernel
 // wait for the layer, so each layer's fp16 copy lives only until its GEMM (else the scheduler can run every layer's dequantize
 // first, and they'd all be in memory at once). grid (N_OUT * K / 8 / 128), 128 threads: 8 weights (one 16-byte store) per thread.
-// OUT: [N_OUT][K] fp16, the segments' rows one after another; SEG_DISPATCH calls dequant8 on the segment that owns the row.
+// OUT: [N_OUT][K] fp16, the segments' rows one after another (or two segments' rows alternating, for the GEMM's SwiGLU epilogue);
+// SEG_DISPATCH calls dequant8 on the segment that owns the row.
 
 // weights col..col+7 of row wr
 template <int QT> __device__ __forceinline__ void dequant8(const unsigned char *wr, int col, float (&v)[8]);

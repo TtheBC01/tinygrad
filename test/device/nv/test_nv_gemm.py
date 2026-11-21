@@ -273,9 +273,10 @@ class TestNVQuant(unittest.TestCase):
         self.assertEqual(kinds, expect)
 
   def test_glu_ffn(self):
-    # down(gated_activation(gate(x), up(x))): in decode the activation runs in down's input quantization; Llama's SwiGLU and the
-    # gpt-oss form (alpha 1.702, clamp 7, up bias 1)
+    # down(gated_activation(gate(x), up(x))): in decode the activation runs in down's input quantization, in prefill in the gate/up
+    # GEMM's epilogue (on rows dequantized interleaved); Llama's SwiGLU and the gpt-oss form (alpha 1.702, clamp 7, up bias 1)
     from tinygrad.llm.kernels.amd import glu_ffn
+    from tinygrad.uop.ops import Ops
     k, h = 1024, 2048
     for qtypes, glu in (((Q4_K, Q4_K, Q6_K), (1.0, None, 0.0)), ((Q8_0, Q8_0, Q8_0), (1.702, 7.0, 1.0))):
       gate, up = self._shared_linears(((qtypes[0], h), (qtypes[1], h)), k, seed=10)
@@ -285,15 +286,21 @@ class TestNVQuant(unittest.TestCase):
         if limit is not None: g, u = g.clamp(max_=limit), u.clamp(-limit, limit)
         return g * (g * alpha).sigmoid() * (u + up_bias)
       wg, wu, wd = (lin.weight.float().numpy() for lin in (gate, up, down))
-      for tokens in (1, 2, 32):
+      for tokens in (1, 2, 32, 100):
         with self.subTest(qtypes=qtypes, tokens=tokens):
           x = np.random.default_rng(8).standard_normal((1, tokens, k)).astype(np.float32)
           x *= 4 / np.std(x @ wg.T)  # gate pre-activations ~4: through the sigmoid's curve and the clamp, and fp16 range in prefill
           g, u = x @ wg.T, x @ wu.T
           if limit is not None: g, u = np.minimum(g, limit), np.clip(u, -limit, limit)
           ref = (g / (1 + np.exp(-alpha * g)) * (u + up_bias)) @ wd.T
-          out = glu_ffn(Tensor(x), gate, up, down, act, glu).numpy()
-          np.testing.assert_allclose(out, ref, atol=0.02 * np.abs(ref).max(), rtol=0)
+          if tokens == 32:
+            sched = Tensor.schedule_linear(glu_ffn(Tensor(x).realize(), gate, up, down, act, glu))
+            names = [u.src[0].src[0].arg.name for u in sched.src if u.src[0].op is Ops.PROGRAM]
+            self.assertEqual(len(names), 4, names)  # the interleaved dequantize, the SwiGLU GEMM, down's dequantize and GEMM
+            self.assertTrue(names[0].endswith("_il") and "_glu" in names[1] and names[2].startswith("nv_q") and "_f32_" in names[3], names)
+          out = glu_ffn(Tensor(x), gate, up, down, act, glu)
+          self.assertEqual(out.dtype, dtypes.float32)
+          np.testing.assert_allclose(out.numpy(), ref, atol=0.02 * np.abs(ref).max(), rtol=0)
 
   def test_rmsnorm_fused(self):
     # q/k/v of an RMSNorm's output: in decode the quantize kernel applies the norm from its input (the norm's own kernels and the

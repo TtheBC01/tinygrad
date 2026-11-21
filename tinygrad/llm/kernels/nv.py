@@ -53,6 +53,14 @@ class Cfg:
     # 48 warps, and 100 KB shared memory with 1 KB reserved per block
     return max(1, min(16, 48 * 32 // self.threads, 65536 // (self.threads * 256), (100 * 1024) // (self.smem + 1024)))
 
+Glu = tuple[float, float|None, float]  # model.gated_activation's SwiGLU: (alpha, limit or None, up_bias)
+def _glu_defines(glu:Glu) -> tuple[str, dict[str, Any]]:
+  # kernel name suffix and #defines for a SwiGLU applied in a kernel (nv_gemm.cu's epilogue, nv_quant.cu's QUANTIZE)
+  alpha, limit, up_bias = glu
+  defines:dict[str, Any] = {"GLU": 1, "GLU_ALPHA": f"{alpha!r}f", "GLU_UP_BIAS": f"{up_bias!r}f"}
+  if limit is not None: defines["GLU_LIMIT"] = f"{limit!r}f"
+  return "_glu" + ("" if glu == (1.0, None, 0.0) else hashlib.md5(repr(glu).encode()).hexdigest()[:6]), defines
+
 DEFAULT = Cfg()
 MAX_SMEM = 99 * 1024  # per-block shared memory limit on sm_86/sm_89 (sm_80 allows 163 KB)
 
@@ -125,18 +133,24 @@ def supported(a:Tensor, b:Tensor, cfg:Cfg=DEFAULT, ta:bool=False, tb:bool=False)
   return all(isinstance(x, int) for x in (M, K, N)) and K == K2 and M % cfg.BM == 0 and N % cfg.BN == 0 and K % cfg.BK == 0
 
 @functools.cache
-def _source(M:int, N:int, K:int, cfg:Cfg, sk_p:int, ta:bool, tb:bool, f32:bool, bf16:bool) -> tuple[str, str]:
+def _source(M:int, N:int, K:int, cfg:Cfg, sk_p:int, ta:bool, tb:bool, f32:bool, bf16:bool, glu:Glu|None=None) -> tuple[str, str]:
   name = f"ampere_gemm_{'t' if ta else 'n'}{'t' if tb else 'n'}{'_bf16' if bf16 else ''}{'_f32' if f32 else ''}_{M}_{N}_{K}_{cfg}" + \
          (f"{sk_p}" if sk_p else "")
-  defines = dict(KNAME=name, M_DIM=M, N_DIM=N, K_DIM=K, BM=cfg.BM, BN=cfg.BN, BK=cfg.BK, WM=cfg.WM, WN=cfg.WN, STAGES=cfg.STAGES,
-                 GROUP_M=cfg.GROUP_M, SK_P=sk_p, TRANS_A=int(ta), TRANS_B=int(tb), OUT_F32=int(f32), BF16=int(bf16))
+  defines:dict[str, Any] = dict(KNAME=name, M_DIM=M, N_DIM=N, K_DIM=K, BM=cfg.BM, BN=cfg.BN, BK=cfg.BK, WM=cfg.WM, WN=cfg.WN,
+                                STAGES=cfg.STAGES, GROUP_M=cfg.GROUP_M, SK_P=sk_p, TRANS_A=int(ta), TRANS_B=int(tb), OUT_F32=int(f32),
+                                BF16=int(bf16))
+  if glu is not None:
+    suffix, gdefs = _glu_defines(glu)
+    name = defines["KNAME"] = name + suffix
+    defines.update(gdefs)
   return name, "".join(f"#define {k} {v}\n" for k, v in defines.items()) + SRC
 
-def _program(C:UOp, A:UOp, B:UOp, WS:UOp, FLAGS:UOp, cfg:Cfg, sp:Split, ta:bool, tb:bool) -> UOp:
-  (M, N), K = C.shape, (A.shape[0] if ta else A.shape[1])
-  name, src = _source(M, N, K, cfg, sp.sk_p, ta, tb, C.dtype == dtypes.float32, A.dtype == dtypes.bfloat16)
+def _program(C:UOp, A:UOp, B:UOp, WS:UOp, FLAGS:UOp, cfg:Cfg, sp:Split, ta:bool, tb:bool, glu:Glu|None=None) -> UOp:
+  (M, NC), K = C.shape, (A.shape[0] if ta else A.shape[1])
+  N = 2 * NC if glu is not None else NC  # with glu, C holds the activation of each (gate, up) column pair
+  name, src = _source(M, N, K, cfg, sp.sk_p, ta, tb, C.dtype == dtypes.float32, A.dtype == dtypes.bfloat16, glu)
   threads, blocks = UOp.special(cfg.threads, "lidx0"), UOp.special(sp.grid, "gidx0")
-  io = 2 * (M * K + K * N) + C.dtype.itemsize * M * N
+  io = 2 * (M * K + K * N) + C.dtype.itemsize * M * NC
   est = Estimates(ops=2 * M * N * K, lds=io, mem=io)
   sink = UOp.sink(C.base, A.base, B.base, WS.base, FLAGS.base, threads, blocks, arg=KernelInfo(name, estimates=est, dyn_shared_mem=cfg.smem))
   return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src)))
@@ -161,35 +175,46 @@ def _grad(dc:UOp, call:UOp, ta:bool, tb:bool) -> tuple:
   db = _gemm(g, a, True, ta) if tb else _gemm(a, g, not ta, False)
   return (None, da.uop, db.uop, None, None)
 
-def _gemm(a:Tensor, b:Tensor, ta:bool=False, tb:bool=False, cfg:Cfg|None=None, out_dtype:DType|None=None) -> Tensor:
+def _gemm(a:Tensor, b:Tensor, ta:bool=False, tb:bool=False, cfg:Cfg|None=None, out_dtype:DType|None=None, glu:Glu|None=None) -> Tensor:
   """op(a) @ op(b) with the custom kernel (op transposes when ta/tb is set), or tinygrad's matmul if it's unsupported.
-  a and b are both fp16 or both bf16. out_dtype is their dtype (default) or float32; the accumulator is always fp32."""
+  a and b are both fp16 or both bf16. out_dtype is their dtype (default) or float32; the accumulator is always fp32.
+  With glu, the product's columns are interleaved (gate, up) pairs and the result (M, N/2) is their SwiGLU (no gradient)."""
   out_dtype = out_dtype or a.dtype
   if cfg is None and a.ndim == 2 and b.ndim == 2 and all(isinstance(x, int) for x in _dims(a, b, ta, tb)):
     M, K, _, N = _dims(a, b, ta, tb)
     cfg = auto_cfg(M, N, K)
-  if cfg is None or not supported(a, b, cfg, ta, tb): return (a.T if ta else a).matmul(b.T if tb else b).cast(out_dtype)
+  if cfg is None or not supported(a, b, cfg, ta, tb):
+    out = (a.T if ta else a).matmul(b.T if tb else b)
+    if glu is None: return out.cast(out_dtype)
+    alpha, limit, up_bias = glu
+    g, u = out.float()[:, 0::2], out.float()[:, 1::2]
+    if limit is not None: g, u = g.minimum(limit), u.clip(-limit, limit)
+    return (g * (g * alpha).sigmoid() * (u + up_bias)).cast(out_dtype)
   a, b = a.contiguous(), b.contiguous()
   M, K, _, N = _dims(a, b, ta, tb)
   sp = split(M, N, K, cfg, num_sms(a.device) if cfg.SK else 0)
   assert sp.sk_workers <= MAX_SK_WORKERS
   assert out_dtype in (a.dtype, dtypes.float32), out_dtype
-  out = Tensor.invalids(M, N, dtype=out_dtype, device=a.device)
+  out = Tensor.invalids(M, N // 2 if glu is not None else N, dtype=out_dtype, device=a.device)
   # stream-K scratch: fp32 partial tiles (one per worker), and the per-device flag buffer (one-element dummy when stream-K is off)
   ws = Tensor.empty(sp.sk_workers * cfg.BM * cfg.BN if sp.sk_workers else 1, dtype=dtypes.float32, device=a.device)
   flags = _flags(a.device) if sp.sk_workers else Tensor.empty(1, dtype=dtypes.int32, device=a.device)
-  return Tensor.custom_kernel(out, a, b, ws, flags, fxn=functools.partial(_program, cfg=cfg, sp=sp, ta=ta, tb=tb),
-                              grad_fxn=functools.partial(_grad, ta=ta, tb=tb))[0]
+  return Tensor.custom_kernel(out, a, b, ws, flags, fxn=functools.partial(_program, cfg=cfg, sp=sp, ta=ta, tb=tb, glu=glu),
+                              grad_fxn=functools.partial(_grad, ta=ta, tb=tb) if glu is None else None)[0]
 
 NV_LINEAR_MIN_ROWS = 16  # below this (decode), tinygrad's own GEMV is the right kernel
 
-def nv_linear(x:Tensor, weight:Tensor, dequant:Callable[[Tensor], Tensor|None]|None=None) -> Tensor|None:
+def nv_linear(x:Tensor, weight:Tensor, dequant:Callable[[Tensor], Tensor|None]|None=None, glu:Glu|None=None,
+              out_dtype:DType|None=None) -> Tensor|None:
   """x @ weight.T for a Linear layer (weight: (out, in) fp16 or bf16), or None if the custom GEMM doesn't apply.
-  x may be fp32 (it's cast to the weight dtype for the tensor cores); the result is fp32 then, accumulated in fp32 either way.
+  x may be fp32 (it's cast to the weight dtype for the tensor cores); the result is in x's dtype (or out_dtype), accumulated in fp32.
   A symbolic token count is padded to its max so the kernel sees static shapes, and the padding is sliced off.
-  dequant(x2) makes the fp16 weight from quantized blocks instead (weight then only gives the shape), given the GEMM's input."""
+  dequant(x2) makes the fp16 weight from quantized blocks instead (weight then only gives the shape), given the GEMM's input.
+  With glu, weight's rows are interleaved (gate, up) pairs and the result (..., out/2) is their SwiGLU in the weight's dtype."""
   if weight.dtype not in (dtypes.half, dtypes.bfloat16) or weight.ndim != 2 or weight.uop.axis is not None: return None
   if x.dtype not in (weight.dtype, dtypes.float32): return None
+  if out_dtype is None: out_dtype = weight.dtype if glu is not None else x.dtype
+  if out_dtype not in (weight.dtype, dtypes.float32): return None
   if not nv_gemm_supported(weight.device) or x.device != weight.device: return None
   N, K = weight.shape
   if not isinstance(N, int) or not isinstance(K, int) or x.shape[-1] != K: return None
@@ -207,10 +232,11 @@ def nv_linear(x:Tensor, weight:Tensor, dequant:Callable[[Tensor], Tensor|None]|N
   if dequant is not None:
     if (w:=dequant(x2.contiguous())) is None: return None
     weight = w
-  out = _gemm(x2, weight, tb=True, cfg=cfg, out_dtype=x.dtype)
+  out = _gemm(x2, weight, tb=True, cfg=cfg, out_dtype=out_dtype, glu=glu)
   if Mp != M: out = out[:M]
-  out = out.reshape(*xs.shape[:-1], N)
-  return out if xs is x else out.shrink(tuple((0, s) for s in (*x.shape[:-1], N)))
+  NO = N // 2 if glu is not None else N
+  out = out.reshape(*xs.shape[:-1], NO)
+  return out if xs is x else out.shrink(tuple((0, s) for s in (*x.shape[:-1], NO)))
 
 # ******** causal flash attention on the KV cache (prefill) ********
 
@@ -327,7 +353,6 @@ NV_QUANT_ALIGN = {Q8_0: 8, Q4_K: 16, Q6_K: 8}  # byte alignment of the weights t
 NV_QUANT_MAX_TOKENS = 8  # each warp keeps one accumulator per token; prefill dequantizes to fp16 for the GEMM instead
 
 QuantSeg = tuple[Tensor, int, int]  # one weight of a GEMV or dequant launch: (packed blocks, ggml type, rows)
-Glu = tuple[float, float|None, float]  # model.gated_activation's SwiGLU: (alpha, limit or None, up_bias)
 
 def _byte_offset(t:Tensor) -> int|None:
   # offset of t's data in its buffer, in bytes (a GGUF tensor is a view into the whole file's buffer)
@@ -338,9 +363,14 @@ def _seg_ok(seg:QuantSeg, k:int, device:str|tuple[str, ...]|None) -> bool:
   return qtype in NV_QUANT_UNIT and k % NV_QUANT_UNIT[qtype] == 0 and packed.device == device and packed.uop.axis is None and \
     packed.nbytes() == int(n * k * NV_QUANT_BYTES[qtype])
 
-def _seg_source(segs:tuple[tuple[int, int], ...], stage:str, ksplit:int) -> dict[str, str]:
-  # SEG_PARAMS and SEG_DISPATCH for nv_quant.cu: the weight pointers, and which weight a GEMV block / DEQUANT thread works on
+def _seg_source(segs:tuple[tuple[int, int], ...], stage:str, ksplit:int, interleave:bool=False) -> dict[str, str]:
+  # SEG_PARAMS and SEG_DISPATCH for nv_quant.cu: the weight pointers, and which weight a GEMV block / DEQUANT thread works on.
+  # interleave (DEQUANT, two weights of the same rows): output row 2r is row r of the first, 2r + 1 row r of the second
   params = ", ".join(f"const unsigned char *__restrict__ W{i}" for i in range(len(segs)))
+  if interleave:
+    (q0, _), (q1, _) = segs
+    return {"SEG_PARAMS": params, "SEG_DISPATCH": f"if (!(row & 1)) dequant8<{q0}>(W0 + (size_t)(row >> 1) * QRow<{q0}>::BYTES, col, v); "
+                                                  f"else dequant8<{q1}>(W1 + (size_t)(row >> 1) * QRow<{q1}>::BYTES, col, v);"}
   calls, start, col = [], 0, 0
   for i, (qtype, n) in enumerate(segs):
     if stage == "GEMV":
@@ -358,21 +388,20 @@ _CTYPE = {dtypes.float32: "float", dtypes.half: "half"}
 Norm = tuple[float, DType, DType, DType]
 
 def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, segs:tuple[tuple[int, int], ...]=(), ksplit:int=1,
-                   glu:Glu|None=None, norm:Norm|None=None, attn:DecodeCfg|None=None) -> UOp:
+                   glu:Glu|None=None, norm:Norm|None=None, attn:DecodeCfg|None=None, interleave:bool=False) -> UOp:
   qts, ns, ntot = "x".join(str(q) for q, _ in segs), "x".join(str(n) for _, n in segs), sum(n for _, n in segs)
   wbytes = int(sum(n * k * NV_QUANT_BYTES[q] for q, n in segs))
   if stage == "DEQUANT":
-    name, defines = f"nv_q{qts}_dequant_{ns}_{k}", {"DEQUANT": 1, "N_OUT": ntot, **_seg_source(segs, stage, ksplit)}
+    name = f"nv_q{qts}_dequant_{ns}_{k}" + ("_il" if interleave else "")
+    defines = {"DEQUANT": 1, "N_OUT": ntot, **_seg_source(segs, stage, ksplit, interleave)}
     dims = (UOp.special(128, "lidx0"), UOp.special(ntot * k // 1024, "gidx0"))
     io = wbytes + ntot * k * 2
     est = Estimates(ops=3 * ntot * k, lds=io, mem=io)
   elif stage == "QUANTIZE":
     name, defines = f"nv_q8_quantize_{ntok}_{k}", {"QUANTIZE": 1}
     if glu is not None:
-      alpha, limit, up_bias = glu
-      name += "_glu" + ("" if glu == (1.0, None, 0.0) else hashlib.md5(repr(glu).encode()).hexdigest()[:6])
-      defines.update({"GLU": 1, "GLU_ALPHA": f"{alpha!r}f", "GLU_UP_BIAS": f"{up_bias!r}f"})
-      if limit is not None: defines["GLU_LIMIT"] = f"{limit!r}f"
+      suffix, gdefs = _glu_defines(glu)
+      name, defines = name + suffix, {**defines, **gdefs}
     if norm is not None:
       eps, xdt, wdt, wuse = norm
       name += "_norm" + hashlib.md5(repr(norm).encode()).hexdigest()[:6]
@@ -420,12 +449,14 @@ def nv_quant_linear(x:Tensor, packed:Tensor, qtype:int, out_features:int, in_fea
   as find_packed returns them). The result is in x's dtype (accumulated in fp32), or None if the kernel doesn't apply."""
   return None if (out:=nv_quant_gemv(x, [(packed, qtype, out_features)], in_features)) is None else out.cast(x.dtype)
 
-def nv_dequant(segs:Sequence[QuantSeg], in_features:int, dep:Tensor) -> Tensor|None:
+def nv_dequant(segs:Sequence[QuantSeg], in_features:int, dep:Tensor, interleave:bool=False) -> Tensor|None:
   """The (sum of rows, in_features) fp16 weight of the packed GGUF blocks (Q4_K, Q6_K or Q8_0) of segs, one after another, or None
-  if unsupported. The kernel waits for dep (the layer's input, otherwise unused) so each layer's copy is made right before its GEMM."""
+  if unsupported. The kernel waits for dep (the layer's input, otherwise unused) so each layer's copy is made right before its GEMM.
+  interleave (two segs of the same rows, e.g. gate and up): their rows alternate instead, for nv_linear's glu."""
   N, K = sum(n for _, _, n in segs), in_features
   if not segs or (N * K) % 1024 or not all(_seg_ok(seg, K, dep.device) for seg in segs): return None
-  fxn = functools.partial(_quant_program, stage="DEQUANT", k=K, ntok=0, segs=tuple((q, n) for _, q, n in segs))
+  if interleave and (len(segs) != 2 or segs[0][2] != segs[1][2]): return None
+  fxn = functools.partial(_quant_program, stage="DEQUANT", k=K, ntok=0, segs=tuple((q, n) for _, q, n in segs), interleave=interleave)
   return Tensor.custom_kernel(Tensor.empty(N, K, dtype=dtypes.half, device=dep.device), *(p for p, _, _ in segs), dep, fxn=fxn)[0]
 
 _NORM_SRC:dict[UOp, tuple[Tensor, Tensor, float]] = {}

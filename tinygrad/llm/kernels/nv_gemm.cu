@@ -6,6 +6,9 @@
 // ldmatrix (+ .trans for B) feeding mma.sync.m16n8k16.
 // Stream-K tail (SK_P > 0): tiles that would leave the last wave partly empty are split along K across all SK_P block slots,
 // and partial sums are merged through a fp32 workspace, so every SM stays busy to the end.
+// With GLU (#define GLU, GLU_ALPHA, GLU_UP_BIAS, optionally GLU_LIMIT), the columns of op(A) @ op(B) are interleaved (gate, up) pairs
+// and C[M][N/2] is their SwiGLU, model.gated_activation's g * sigmoid(GLU_ALPHA g) * (u + GLU_UP_BIAS) after the optional clamp:
+// the LLM's gate/up projection writes its activation directly (nv.py interleaves the weight's rows when it dequantizes them).
 // The host side (tinygrad/llm/kernels/nv.py) prepends #defines for KNAME, M_DIM, N_DIM, K_DIM and the tile config.
 // (nv_common.cuh, with the cp.async / ldmatrix / mma helpers, is prepended by nv.py)
 
@@ -53,6 +56,21 @@ typedef half in_t;
 typedef float out_t;
 #else
 typedef in_t out_t;
+#endif
+__device__ __forceinline__ void store2(float *p, float x, float y) { *(float2 *)p = make_float2(x, y); }
+__device__ __forceinline__ void store2(half *p, float x, float y) { *(half2 *)p = __floats2half2_rn(x, y); }
+__device__ __forceinline__ void store2(__nv_bfloat16 *p, float x, float y) { *(__nv_bfloat162 *)p = __floats2bfloat162_rn(x, y); }
+
+#ifdef GLU
+#define C_COLS (N_DIM / 2)
+__device__ __forceinline__ float glu_act(float g, float u) {
+#ifdef GLU_LIMIT
+  g = fminf(g, GLU_LIMIT), u = fminf(fmaxf(u, -GLU_LIMIT), GLU_LIMIT);
+#endif
+  return g / (1.0f + expf(-GLU_ALPHA * g)) * (u + GLU_UP_BIAS);  // accurate expf: free here, the GEMM is compute bound
+}
+#else
+#define C_COLS N_DIM
 #endif
 #ifndef SK_P
 #define SK_P 0  // concurrent block slots on the GPU (SMs x resident blocks per SM); 0 disables stream-K
@@ -214,15 +232,17 @@ KNAME(out_t *__restrict__ C, const in_t *__restrict__ A, const in_t *__restrict_
 #pragma unroll
       for (int nt = 0; nt < NT; nt++) {
         int row = bm + wm * WM + mt * 16 + (lane >> 2), col = bn + wn * WN + nt * 8 + (lane & 3) * 2;
-#if OUT_F32
-        *(float2 *)&C[(size_t)row * N_DIM + col] = make_float2(acc[mt][nt][0], acc[mt][nt][1]);
-        *(float2 *)&C[(size_t)(row + 8) * N_DIM + col] = make_float2(acc[mt][nt][2], acc[mt][nt][3]);
-#elif BF16
-        *(__nv_bfloat162 *)&C[(size_t)row * N_DIM + col] = __floats2bfloat162_rn(acc[mt][nt][0], acc[mt][nt][1]);
-        *(__nv_bfloat162 *)&C[(size_t)(row + 8) * N_DIM + col] = __floats2bfloat162_rn(acc[mt][nt][2], acc[mt][nt][3]);
+#ifdef GLU
+        // a thread holds one (gate, up) pair per row: lanes 2i and 2i+1 have adjacent outputs, the even one stores both
+        const float a0 = glu_act(acc[mt][nt][0], acc[mt][nt][1]), a1 = glu_act(acc[mt][nt][2], acc[mt][nt][3]);
+        const float b0 = __shfl_xor_sync(0xffffffff, a0, 1), b1 = __shfl_xor_sync(0xffffffff, a1, 1);
+        if (!(lane & 1)) {
+          store2(&C[(size_t)row * C_COLS + col / 2], a0, b0);
+          store2(&C[(size_t)(row + 8) * C_COLS + col / 2], a1, b1);
+        }
 #else
-        *(half2 *)&C[(size_t)row * N_DIM + col] = __floats2half2_rn(acc[mt][nt][0], acc[mt][nt][1]);
-        *(half2 *)&C[(size_t)(row + 8) * N_DIM + col] = __floats2half2_rn(acc[mt][nt][2], acc[mt][nt][3]);
+        store2(&C[(size_t)row * N_DIM + col], acc[mt][nt][0], acc[mt][nt][1]);
+        store2(&C[(size_t)(row + 8) * N_DIM + col], acc[mt][nt][2], acc[mt][nt][3]);
 #endif
       }
   };
