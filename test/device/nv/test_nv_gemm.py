@@ -97,6 +97,8 @@ def _attention_ref(q, cache, valid_end):
   p = np.exp(s - s.max(-1, keepdims=True))
   return (p / p.sum(-1, keepdims=True)) @ v
 
+def _heads(out:np.ndarray, H:int) -> np.ndarray: return out.reshape(*out.shape[:2], H, -1).transpose(0, 2, 1, 3)  # (B,T,H*D) -> (B,H,T,D)
+
 class TestNVFlashAttention(unittest.TestCase):
   def setUp(self):
     if not nv_gemm_supported(Tensor.empty(1).device): self.skipTest("NV/CUDA sm_80+ with the CUDA C renderer required")
@@ -106,8 +108,8 @@ class TestNVFlashAttention(unittest.TestCase):
     q = rng.standard_normal((B, H, T, D)).astype(np.float32)
     cache = rng.standard_normal((2, B, KVH, N, D)).astype(np.float16)  # the tail past valid_end is stale: must be ignored
     out = nv_flash_attention(Tensor(q), Tensor(cache), prefix + T)
-    assert out is not None and out.shape == (B, H, T, D) and out.dtype == dtypes.float32
-    np.testing.assert_allclose(out.numpy(), _attention_ref(q, cache, prefix + T), atol=3e-3, rtol=1e-2)
+    assert out is not None and out.shape == (B, T, H * D) and out.dtype == dtypes.float32
+    np.testing.assert_allclose(_heads(out.numpy(), H), _attention_ref(q, cache, prefix + T), atol=3e-3, rtol=1e-2)
 
   def test_shapes(self):
     for B, H, KVH, D, T, prefix in ((1, 8, 2, 64, 128, 0), (1, 8, 8, 128, 64, 0), (2, 4, 2, 128, 64, 100), (1, 8, 2, 64, 32, 37),
@@ -122,8 +124,8 @@ class TestNVFlashAttention(unittest.TestCase):
         q = rng.standard_normal((B, H, 1, D)).astype(np.float32)
         cache = rng.standard_normal((2, B, KVH, 4096, D)).astype(np.float16)
         out = nv_flash_attention(Tensor(q), Tensor(cache), valid_end)
-        assert out is not None and out.shape == (B, H, 1, D)
-        np.testing.assert_allclose(out.numpy(), _attention_ref(q, cache, valid_end), atol=3e-3, rtol=1e-2)
+        assert out is not None and out.shape == (B, 1, H * D)
+        np.testing.assert_allclose(_heads(out.numpy(), H), _attention_ref(q, cache, valid_end), atol=3e-3, rtol=1e-2)
 
   def test_decode_symbolic_jit(self):
     B, H, KVH, D, N = 1, 24, 8, 128, 2048
@@ -133,7 +135,8 @@ class TestNVFlashAttention(unittest.TestCase):
     jf = TinyJit(lambda q, pos: nv_flash_attention(q, cache, pos + 1).realize())
     for pos in (0, 700, 5, 2047):
       q = rng.standard_normal((B, H, 1, D)).astype(np.float32)
-      np.testing.assert_allclose(jf(Tensor(q), vp.bind(pos)).numpy(), _attention_ref(q, cache.numpy(), pos + 1), atol=3e-3, rtol=1e-2)
+      np.testing.assert_allclose(_heads(jf(Tensor(q), vp.bind(pos)).numpy(), H), _attention_ref(q, cache.numpy(), pos + 1), atol=3e-3,
+                                 rtol=1e-2)
 
   def test_symbolic_jit(self):
     # chunked prefill: a symbolic chunk length T at a symbolic position, padded to the static max inside
@@ -141,11 +144,11 @@ class TestNVFlashAttention(unittest.TestCase):
     rng = np.random.default_rng(0)
     cache = Tensor(rng.standard_normal((2, B, KVH, N, D)).astype(np.float16)).realize()
     vt, vp = UOp.variable("toks", 1, CH), UOp.variable("pos", 0, N - CH)
-    jf = TinyJit(lambda q, pos, toks: nv_flash_attention(q, cache, pos + toks).pad_to((B, H, CH, D)).realize())
+    jf = TinyJit(lambda q, pos, toks: nv_flash_attention(q, cache, pos + toks).pad_to((B, CH, H * D)).realize())
     for T, pos in ((64, 0), (17, 64), (64, 81), (5, 300)):
       q = rng.standard_normal((B, H, CH, D)).astype(np.float32)
       t, p = vt.bind(T), vp.bind(pos)
-      out = jf(Tensor(q)[:, :, :t].contiguous(), p, t).numpy()[:, :, :T]
+      out = _heads(jf(Tensor(q)[:, :, :t].contiguous(), p, t).numpy()[:, :T], H)
       np.testing.assert_allclose(out, _attention_ref(q[:, :, :T], cache.numpy(), pos + T), atol=3e-3, rtol=1e-2)
 
 def _quant_blocks(qtype:int, n:int, k:int, seed=0) -> np.ndarray:
@@ -319,6 +322,35 @@ class TestNVQuant(unittest.TestCase):
           for lin, out in zip(lins, outs):
             ref = h @ lin.weight.float().numpy().T
             np.testing.assert_allclose(out.float().numpy(), ref, atol=0.015 * np.abs(ref).max(), rtol=0)
+
+  def test_decode_attention_fused(self):
+    # the output projection of flash decoding's output: its quantize kernel merges the attention splits (the merge kernel never
+    # runs), for KV lengths that leave splits empty or fill all of them, batch 2, and a symbolic length under JIT
+    from tinygrad.uop.ops import Ops
+    for B, H, KVH, D in ((1, 16, 4, 64), (2, 8, 8, 128)):
+      lin = self._shared_linears(((Q4_K, 512),), H * D, seed=40 + D)[0]
+      wn = lin.weight.float().numpy()
+      rng = np.random.default_rng(D)
+      cache = Tensor(rng.standard_normal((2, B, KVH, 4096, D)).astype(np.float16)).realize()
+      def ref(q, ve): return _attention_ref(q, cache.numpy(), ve).transpose(0, 2, 1, 3).reshape(B, 1, H * D) @ wn.T
+      for ve in (1, 37, 1000, 4096):
+        with self.subTest(B=B, D=D, valid_end=ve):
+          q = rng.standard_normal((B, H, 1, D)).astype(np.float32)
+          if ve == 1000:
+            sched = Tensor.schedule_linear(lin(nv_flash_attention(Tensor(q), cache, ve)))
+            names = [u.src[0].src[0].arg.name for u in sched.src if u.src[0].op is Ops.PROGRAM]
+            self.assertEqual([n.split("_")[:4] for n in names if n.startswith("nv_")],
+                             [["nv", "flash", "decode", "partial"], ["nv", "q8", "quantize", str(B)], ["nv", "q12", "gemv", str(B)]], names)
+            self.assertIn("_attn", names[-2])
+          r = ref(q, ve)
+          np.testing.assert_allclose(lin(nv_flash_attention(Tensor(q), cache, ve)).numpy(), r, atol=0.015 * np.abs(r).max(), rtol=0)
+      vp = UOp.variable("pos", 0, 4095)
+      jf = TinyJit(lambda q, pos: lin(nv_flash_attention(q, cache, pos + 1)).realize())
+      for pos in (0, 700, 5, 4095):
+        with self.subTest(B=B, D=D, jit_pos=pos):
+          q = rng.standard_normal((B, H, 1, D)).astype(np.float32)
+          r = ref(q, pos + 1)
+          np.testing.assert_allclose(jf(Tensor(q), vp.bind(pos)).numpy(), r, atol=0.015 * np.abs(r).max(), rtol=0)
 
   def test_unsupported_type(self):
     self.assertIsNone(nv_quant_linear(Tensor.empty(1, 256), Tensor.empty(256 * 84 // 256, dtype=dtypes.uint8), 10, 1, 256))  # Q2_K

@@ -25,8 +25,9 @@ _DIR = pathlib.Path(__file__).parent
 COMMON = (_DIR / "nv_common.cuh").read_text()
 SRC = COMMON + (_DIR / "nv_gemm.cu").read_text()
 FLASH_SRC = COMMON + (_DIR / "nv_flash.cu").read_text()
-DECODE_SRC = COMMON + (_DIR / "nv_decode.cu").read_text()
-QUANT_SRC = COMMON + (_DIR / "nv_quant.cu").read_text()
+DECODE_MERGE = (_DIR / "nv_decode_merge.cuh").read_text()
+DECODE_SRC = COMMON + DECODE_MERGE + (_DIR / "nv_decode.cu").read_text()
+QUANT_SRC = COMMON + DECODE_MERGE + (_DIR / "nv_quant.cu").read_text()
 
 @dataclass(frozen=True)
 class Cfg:
@@ -242,35 +243,57 @@ def _int_tensor(x:int|UOp) -> Tensor|None:
     return a + b if x.op is Ops.ADD else a * b
   return None
 
-def _decode_program(OUT:UOp, *srcs:UOp, stage:str, nb:int, nh:int, nkv:int, nctx:int, hd:int, nsplit:int) -> UOp:
-  name = f"nv_flash_decode_{stage.lower()}_{nb}_{nh}_{nkv}_{nctx}_{hd}_s{nsplit}"
-  defines = {stage: 1, "KNAME": name, "NB": nb, "NH": nh, "NKV": nkv, "NCTX": nctx, "HD": hd, "NSPLIT": nsplit}
+@dataclass(frozen=True)
+class DecodeCfg:
+  """Flash decoding's launch shape: NSPLIT blocks per (batch, KV head) of NWARPS warps, each warp issuing UNR steps of loads at once."""
+  nb:int
+  nh:int
+  nkv:int
+  nctx:int
+  hd:int
+  nsplit:int
+  nwarps:int = 4
+  unr:int = 2
+  @property
+  def minkeys(self) -> int: return self.nwarps * (32 // (self.hd // 8)) * self.unr  # keys per block step: the fewest a split gets
+  @property
+  def name(self) -> str: return f"{self.nb}_{self.nh}_{self.nkv}_{self.nctx}_{self.hd}_s{self.nsplit}w{self.nwarps}u{self.unr}"
+
+def _decode_program(OUT:UOp, *srcs:UOp, stage:str, cfg:DecodeCfg) -> UOp:
+  name = f"nv_flash_decode_{stage.lower()}_{cfg.name}"
+  defines = {stage: 1, "KNAME": name, "NB": cfg.nb, "NH": cfg.nh, "NKV": cfg.nkv, "NCTX": cfg.nctx, "HD": cfg.hd, "NSPLIT": cfg.nsplit,
+             "NWARPS": cfg.nwarps, "UNR": cfg.unr, "MINKEYS": cfg.minkeys}
   src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + DECODE_SRC
-  dims:tuple[UOp, ...] = (UOp.special(128, "lidx0"), UOp.special(nsplit, "gidx0"), UOp.special(nb * nkv, "gidx1")) if stage == "PARTIAL" else \
-    (UOp.special(hd, "lidx0"), UOp.special(nb * nh, "gidx0"))
+  dims:tuple[UOp, ...] = (UOp.special(32 * cfg.nwarps, "lidx0"), UOp.special(cfg.nsplit, "gidx0"), UOp.special(cfg.nb * cfg.nkv, "gidx1")) \
+    if stage == "PARTIAL" else (UOp.special(cfg.hd, "lidx0"), UOp.special(cfg.nb * cfg.nh, "gidx0"))
   # the KV bytes read depend on the runtime length: count the query side only
-  est = Estimates(ops=4 * nb * nh * hd, lds=4 * nb * nh * hd, mem=4 * nb * nh * hd)
+  n = cfg.nb * cfg.nh * cfg.hd
+  est = Estimates(ops=4 * n, lds=4 * n, mem=4 * n)
   sink = UOp.sink(OUT.base, *[x.base for x in srcs], *dims, arg=KernelInfo(name, estimates=est))
   return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src)))
 
 def nv_flash_decode(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp, nsms:int) -> Tensor|None:
-  """One query token per sequence: q (B, H, 1, D) over the fp16 cache's keys [0, valid_end). (B, H, 1, D) fp32, or None."""
+  """One query token per sequence: q (B, H, 1, D) over the fp16 cache's keys [0, valid_end). (B, 1, H * D) fp32, or None."""
   B, H, _, D = (int(x) for x in q.shape)
   KVH, NCTX = int(assigned_kv.shape[2]), int(assigned_kv.shape[3])
   if (end_t:=_int_tensor(valid_end)) is None: return None
   # enough blocks to fill the GPU a few times over: each streams its share of the keys
-  nsplit = max(1, min(64, -(-4 * nsms // (B * KVH))))
-  def prg(stage:str): return functools.partial(_decode_program, stage=stage, nb=B, nh=H, nkv=KVH, nctx=NCTX, hd=D, nsplit=nsplit)
-  part = Tensor.empty(B * H * nsplit * (D + 2), dtype=dtypes.float32, device=q.device)
-  part = Tensor.custom_kernel(part, q.cast(dtypes.half).contiguous(), assigned_kv, end_t.contiguous(), fxn=prg("PARTIAL"))[0]
+  cfg = DecodeCfg(B, H, KVH, NCTX, D, nsplit=max(1, min(64, -(-getenv("NV_DECODE_BPS", 4) * nsms // (B * KVH)))),
+                  nwarps=getenv("NV_DECODE_WARPS", 4), unr=getenv("NV_DECODE_UNR", 2))
+  params = end_t.contiguous()
+  part = Tensor.empty(B * H * cfg.nsplit * (D + 2), dtype=dtypes.float32, device=q.device)
+  part = Tensor.custom_kernel(part, q.cast(dtypes.half).contiguous(), assigned_kv, params,
+                              fxn=functools.partial(_decode_program, stage="PARTIAL", cfg=cfg))[0]
   out = Tensor.invalids(B, 1, H, D, dtype=dtypes.float32, device=q.device)
-  return Tensor.custom_kernel(out, part, fxn=prg("COMBINE"))[0].transpose(1, 2)
+  out = Tensor.custom_kernel(out, part, params, fxn=functools.partial(_decode_program, stage="COMBINE", cfg=cfg))[0].reshape(B, 1, H * D)
+  _note_decode(out, part, params, cfg)
+  return out
 
 def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor|None:
   """Causal attention of q (B, H, T, D) over the fp16 KV cache assigned_kv (2, B, KvH, max_context, D), whose keys [0, valid_end)
-  are valid; query t sits at position valid_end - T + t. Returns (B, H, T, D) fp32, or None if the kernel doesn't apply
-  (unsupported device or shapes). One token (decode) uses flash decoding. A symbolic T is padded to its max, and the padding is
-  sliced off."""
+  are valid; query t sits at position valid_end - T + t. Returns (B, T, H * D) fp32 (the heads side by side, as the output
+  projection takes them), or None if the kernel doesn't apply (unsupported device or shapes). One token (decode) uses flash
+  decoding. A symbolic T is padded to its max, and the padding is sliced off."""
   if not nv_gemm_supported(q.device) or assigned_kv.dtype != dtypes.half or q.ndim != 4 or assigned_kv.ndim != 5: return None
   if q.uop.axis is not None or assigned_kv.uop.axis is not None: return None
   B, H, T, D = q.shape
@@ -290,8 +313,8 @@ def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tenso
   params = end_t.cat(start_t).contiguous()
   out = Tensor.invalids(B, TQ, H, D, dtype=dtypes.float32, device=q.device)
   out = Tensor.custom_kernel(out, qp.cast(dtypes.half).contiguous(), assigned_kv, params,
-                             fxn=functools.partial(_flash_program, cfg=cfg))[0].transpose(1, 2)
-  return out if isinstance(T, int) and T == TQ else out.shrink((None, None, (0, T), None))
+                             fxn=functools.partial(_flash_program, cfg=cfg))[0]
+  return (out if isinstance(T, int) and T == TQ else out.shrink((None, (0, T), None, None))).reshape(B, T, H * D)
 
 # ******** GEMV on GGUF quantized weights (decode) ********
 
@@ -335,7 +358,7 @@ _CTYPE = {dtypes.float32: "float", dtypes.half: "half"}
 Norm = tuple[float, DType, DType, DType]
 
 def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, segs:tuple[tuple[int, int], ...]=(), ksplit:int=1,
-                   glu:Glu|None=None, norm:Norm|None=None) -> UOp:
+                   glu:Glu|None=None, norm:Norm|None=None, attn:DecodeCfg|None=None) -> UOp:
   qts, ns, ntot = "x".join(str(q) for q, _ in segs), "x".join(str(n) for _, n in segs), sum(n for _, n in segs)
   wbytes = int(sum(n * k * NV_QUANT_BYTES[q] for q, n in segs))
   if stage == "DEQUANT":
@@ -355,8 +378,11 @@ def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, segs:tuple[tu
       name += "_norm" + hashlib.md5(repr(norm).encode()).hexdigest()[:6]
       defines.update({"NORM": 1, "NORM_EPS": f"{eps!r}f", "XTYPE": _CTYPE[xdt], "WTYPE": _CTYPE[wdt]})
       if wuse != wdt and wuse == dtypes.half: defines["WLOAD(w)"] = "__half2float(__float2half_rn((float)(w)))"
+    if attn is not None:
+      name += f"_attn{attn.hd}s{attn.nsplit}m{attn.minkeys}"
+      defines.update({"ATTN": 1, "HD": attn.hd, "NSPLIT": attn.nsplit, "MINKEYS": attn.minkeys})
     dims = (UOp.special(128, "lidx0"), UOp.special(ntok * k // 128, "gidx0"))
-    io = ntok * k * (4 * (2 if glu else 1) + 1) + (k * 4 if norm else 0)
+    io = ntok * k * (4 * (2 if glu else attn.nsplit if attn else 1) + 1) + (k * 4 if norm else 0)
     est = Estimates(ops=(10 if glu else 6 if norm else 3) * ntok * k, lds=io, mem=io)
   else:
     name = f"nv_q{qts}_gemv_{ntok}_{ns}_{k}_ks{ksplit}"
@@ -419,6 +445,13 @@ def _norm_src(x:Tensor, K:int) -> tuple[Tensor, Tensor, Tensor, float]|None:
   stored = Tensor(w.uop.src[0]) if w.uop.op is Ops.CAST and w.uop.src[0].dtype in _CTYPE else w
   return nx, w, stored, eps
 
+_ATTN_SRC:dict[UOp, tuple[Tensor, Tensor, DecodeCfg]] = {}
+def _note_decode(out:Tensor, part:Tensor, params:Tensor, cfg:DecodeCfg):
+  # out is the merge of flash decoding's partials part: a quant GEMV of out (the output projection) merges them in its quantize
+  # kernel instead, so the merge kernel doesn't run
+  if len(_ATTN_SRC) >= 8: _ATTN_SRC.pop(next(iter(_ATTN_SRC)))
+  _ATTN_SRC[out.uop] = (part, params, cfg)
+
 _XQ_CACHE:dict[tuple[UOp, Glu|None], Tensor] = {}
 def _quantize_x(x:Tensor, tokens:int, K:int, glu:Glu|None) -> Tensor:
   # int8 activations for the GEMV. Linears that take the same x one after another (when not fused) quantize it once.
@@ -430,6 +463,10 @@ def _quantize_x(x:Tensor, tokens:int, K:int, glu:Glu|None) -> Tensor:
     nx, w, stored, eps = src
     xq = Tensor.custom_kernel(xq, nx.reshape(tokens, K).contiguous(), stored.contiguous(),
                               fxn=functools.partial(fxn, norm=(eps, nx.dtype, stored.dtype, w.dtype)))[0]
+  elif glu is None and not getenv("DISABLE_NV_ATTN_FUSE") and (asrc:=_ATTN_SRC.get(x.uop)) is not None and \
+       asrc[2].nh * asrc[2].hd == K and asrc[2].nb == tokens:
+    part, params, cfg = asrc
+    xq = Tensor.custom_kernel(xq, part, params, fxn=functools.partial(fxn, attn=cfg))[0]
   else: xq = Tensor.custom_kernel(xq, x.reshape(tokens, x.shape[-1]).float().contiguous(), fxn=fxn)[0]
   if len(_XQ_CACHE) >= 4: _XQ_CACHE.pop(next(iter(_XQ_CACHE)))
   _XQ_CACHE[key] = xq

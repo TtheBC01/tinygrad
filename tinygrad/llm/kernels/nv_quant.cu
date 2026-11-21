@@ -15,18 +15,22 @@
 // With NORM, X ([NTOK][K] XTYPE) is the input of an RMSNorm with weight NW ([K] WTYPE) and the values are its output,
 // x * rsqrt(mean(x^2) + NORM_EPS) * WLOAD(w) (WLOAD can round w as the model's weight dtype): each block sums its token's squares
 // itself (re-reading the row from L2).
+// With ATTN, X is flash decoding's partials ([NTOK][K/HD heads][NSPLIT][HD + 2], nv_decode.cu's P) and params[0] its valid_end:
+// the values are the merged attention output (decode_merge), which is never written out.
 #ifndef XTYPE
 #define XTYPE float
 #endif
 #ifdef NORM
-#define NORM_PARAM , const WTYPE *__restrict__ NW
+#define EXTRA_PARAM , const WTYPE *__restrict__ NW
 #ifndef WLOAD
 #define WLOAD(w) ((float)(w))
 #endif
+#elif defined(ATTN)
+#define EXTRA_PARAM , const int *__restrict__ params
 #else
-#define NORM_PARAM
+#define EXTRA_PARAM
 #endif
-extern "C" __global__ void __launch_bounds__(128) KNAME(int *__restrict__ XQ, const XTYPE *__restrict__ X NORM_PARAM) {
+extern "C" __global__ void __launch_bounds__(128) KNAME(int *__restrict__ XQ, const XTYPE *__restrict__ X EXTRA_PARAM) {
   const int g = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;  // global block of 32
   const int t = g / (K_DIM / 32), b = g % (K_DIM / 32);  // K % 128 == 0: the block's 4 warps share t
 #ifdef GLU
@@ -46,6 +50,11 @@ extern "C" __global__ void __launch_bounds__(128) KNAME(int *__restrict__ XQ, co
   if (lane == 0) wss[threadIdx.x >> 5] = ss;
   __syncthreads();
   const float v = (float)xr[b * 32 + lane] * rsqrtf((wss[0] + wss[1] + wss[2] + wss[3]) / (float)K_DIM + NORM_EPS) * WLOAD(NW[b * 32 + lane]);
+#elif defined(ATTN)
+  static_assert(HD % 32 == 0, "a block of 32 values lies in one head");
+  const int h = b * 32 / HD;
+  const float v = decode_merge<NSPLIT>(X + ((size_t)t * (K_DIM / HD) + h) * NSPLIT * (HD + 2), decode_active_splits(params[0], NSPLIT, MINKEYS),
+                               HD, lane, b * 32 % HD + lane);
 #else
   const float v = X[(size_t)t * K_DIM + b * 32 + lane];
 #endif
