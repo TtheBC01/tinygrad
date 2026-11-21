@@ -12,7 +12,7 @@ With Cfg.SK (default), tiles that would leave the last wave partly empty are spl
 which needs a small fp32 workspace and a zeroed flag buffer per call.
 Run as a script for a correctness check: DEV=NV python -m tinygrad.llm.kernels.nv
 """
-import ctypes, functools, hashlib, pathlib
+import ctypes, functools, hashlib, itertools, pathlib
 from typing import Any, Callable, Sequence
 from dataclasses import dataclass
 from tinygrad import Tensor, dtypes, Device, Context
@@ -28,6 +28,7 @@ FLASH_SRC = COMMON + (_DIR / "nv_flash.cu").read_text()
 DECODE_MERGE = (_DIR / "nv_decode_merge.cuh").read_text()
 DECODE_SRC = COMMON + DECODE_MERGE + (_DIR / "nv_decode.cu").read_text()
 QUANT_SRC = COMMON + DECODE_MERGE + (_DIR / "nv_quant.cu").read_text()
+MMQ_SRC = COMMON + (_DIR / "nv_mmq.cu").read_text()
 
 @dataclass(frozen=True)
 class Cfg:
@@ -102,7 +103,7 @@ class Split:
 
 SK_OVERHEAD = 0.1  # stream-K costs ~10% extra on the work it splits (restarts, fp32 partials through L2, and the power they draw)
 
-def split(M:int, N:int, K:int, cfg:Cfg, sms:int) -> Split:
+def split(M:int, N:int, K:int, cfg:"Cfg|MmqCfg", sms:int) -> Split:
   # mirrors the constexprs in ampere_gemm.cu
   p, tiles, kt = (sms * cfg.blocks_per_sm if cfg.SK else 0), (M // cfg.BM) * (N // cfg.BN), K // cfg.BK
   sk_tiles = 0 if p == 0 or tiles % p == 0 else (tiles % p + p if tiles >= 2 * p else tiles)
@@ -367,10 +368,11 @@ def _seg_source(segs:tuple[tuple[int, int], ...], stage:str, ksplit:int, interle
   # SEG_PARAMS and SEG_DISPATCH for nv_quant.cu: the weight pointers, and which weight a GEMV block / DEQUANT thread works on.
   # interleave (DEQUANT, two weights of the same rows): output row 2r is row r of the first, 2r + 1 row r of the second
   params = ", ".join(f"const unsigned char *__restrict__ W{i}" for i in range(len(segs)))
+  fn, args = ("requant32", "blk, q, sc") if stage == "REQUANT" else ("dequant8", "col, v")
   if interleave:
     (q0, _), (q1, _) = segs
-    return {"SEG_PARAMS": params, "SEG_DISPATCH": f"if (!(row & 1)) dequant8<{q0}>(W0 + (size_t)(row >> 1) * QRow<{q0}>::BYTES, col, v); "
-                                                  f"else dequant8<{q1}>(W1 + (size_t)(row >> 1) * QRow<{q1}>::BYTES, col, v);"}
+    return {"SEG_PARAMS": params, "SEG_DISPATCH": f"if (!(row & 1)) {fn}<{q0}>(W0 + (size_t)(row >> 1) * QRow<{q0}>::BYTES, {args}); "
+                                                  f"else {fn}<{q1}>(W1 + (size_t)(row >> 1) * QRow<{q1}>::BYTES, {args});"}
   calls, start, col = [], 0, 0
   for i, (qtype, n) in enumerate(segs):
     if stage == "GEMV":
@@ -378,7 +380,7 @@ def _seg_source(segs:tuple[tuple[int, int], ...], stage:str, ksplit:int, interle
       calls.append(f"if (blk < {end}) gemv_rows<{qtype}, {n}>(OUT + {col}, W{i}, XQ, blk - {start}, part);")
     else:
       end = start + n
-      call = f"dequant8<{qtype}>(W{i} + (size_t)(row - {start}) * QRow<{qtype}>::BYTES, col, v);"
+      call = f"{fn}<{qtype}>(W{i} + (size_t)(row - {start}) * QRow<{qtype}>::BYTES, {args});"
       calls.append(call if i == len(segs) - 1 else f"if (row < {end}) {call}")
     start, col = end, col + n
   return {"SEG_PARAMS": params, "SEG_DISPATCH": " else ".join(calls)}
@@ -388,15 +390,15 @@ _CTYPE = {dtypes.float32: "float", dtypes.half: "half"}
 Norm = tuple[float, DType, DType, DType]
 
 def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, segs:tuple[tuple[int, int], ...]=(), ksplit:int=1,
-                   glu:Glu|None=None, norm:Norm|None=None, attn:DecodeCfg|None=None, interleave:bool=False) -> UOp:
+                   glu:Glu|None=None, norm:Norm|None=None, attn:DecodeCfg|None=None, interleave:bool=False, xtype:DType|None=None) -> UOp:
   qts, ns, ntot = "x".join(str(q) for q, _ in segs), "x".join(str(n) for _, n in segs), sum(n for _, n in segs)
   wbytes = int(sum(n * k * NV_QUANT_BYTES[q] for q, n in segs))
-  if stage == "DEQUANT":
-    name = f"nv_q{qts}_dequant_{ns}_{k}" + ("_il" if interleave else "")
-    defines = {"DEQUANT": 1, "N_OUT": ntot, **_seg_source(segs, stage, ksplit, interleave)}
-    dims = (UOp.special(128, "lidx0"), UOp.special(ntot * k // 1024, "gidx0"))
-    io = wbytes + ntot * k * 2
-    est = Estimates(ops=3 * ntot * k, lds=io, mem=io)
+  if stage in ("DEQUANT", "REQUANT"):
+    name = f"nv_q{qts}_{stage.lower()}_{ns}_{k}" + ("_il" if interleave else "")
+    defines = {stage: 1, "N_OUT": ntot, **_seg_source(segs, stage, ksplit, interleave)}
+    dims = (UOp.special(128, "lidx0"), UOp.special(ntot * k // (1024 if stage == "DEQUANT" else 4096), "gidx0"))
+    io = wbytes + ntot * k * (2 if stage == "DEQUANT" else 1.25)
+    est = Estimates(ops=3 * ntot * k, lds=int(io), mem=int(io))
   elif stage == "QUANTIZE":
     name, defines = f"nv_q8_quantize_{ntok}_{k}", {"QUANTIZE": 1}
     if glu is not None:
@@ -407,6 +409,7 @@ def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, segs:tuple[tu
       name += "_norm" + hashlib.md5(repr(norm).encode()).hexdigest()[:6]
       defines.update({"NORM": 1, "NORM_EPS": f"{eps!r}f", "XTYPE": _CTYPE[xdt], "WTYPE": _CTYPE[wdt]})
       if wuse != wdt and wuse == dtypes.half: defines["WLOAD(w)"] = "__half2float(__float2half_rn((float)(w)))"
+    if xtype is not None: name, defines = name + "_" + _CTYPE[xtype], {**defines, "XTYPE": _CTYPE[xtype]}
     if attn is not None:
       name += f"_attn{attn.hd}s{attn.nsplit}m{attn.minkeys}"
       defines.update({"ATTN": 1, "HD": attn.hd, "NSPLIT": attn.nsplit, "MINKEYS": attn.minkeys})
@@ -459,6 +462,94 @@ def nv_dequant(segs:Sequence[QuantSeg], in_features:int, dep:Tensor, interleave:
   fxn = functools.partial(_quant_program, stage="DEQUANT", k=K, ntok=0, segs=tuple((q, n) for _, q, n in segs), interleave=interleave)
   return Tensor.custom_kernel(Tensor.empty(N, K, dtype=dtypes.half, device=dep.device), *(p for p, _, _ in segs), dep, fxn=fxn)[0]
 
+# ******** int8 tensor core GEMM for prefill on GGUF quant weights (nv_mmq.cu) ********
+
+@dataclass(frozen=True)
+class MmqCfg:
+  BM: int = 128
+  BN: int = 128
+  WM: int = 64
+  WN: int = 32
+  STAGES: int = 2
+  NBLK: int = 4    # quant blocks (32 of K) per stage
+  GROUP_M: int = 8
+  SK: bool = True
+  @property
+  def BK(self) -> int: return 32 * self.NBLK  # in int8 (= K elements)
+  @property
+  def threads(self) -> int: return (self.BM // self.WM) * (self.BN // self.WN) * 32
+  @property
+  def smem(self) -> int: return self.STAGES * (self.BM + self.BN) * (self.BK + self.NBLK * 8)
+  @property
+  def blocks_per_sm(self) -> int: return max(1, min(48 * 32 // self.threads, (100 * 1024) // (self.smem + 1024)))
+  def __str__(self): return f"{self.BM}x{self.BN}_w{self.WM}x{self.WN}_s{self.STAGES}b{self.NBLK}" + ("_sk" if self.SK else "")
+MMQ = MmqCfg()
+Q6_K_TYPE = 14
+
+def _mmq_program(C:UOp, X:UOp, W8:UOp, WS:UOp, SKWS:UOp, FLAGS:UOp, cfg:MmqCfg, sp:Split, k:int, n:int, q6:str, has_min:bool,
+                 glu:Glu|None) -> UOp:
+  M = int(C.shape[0])
+  name = f"nv_mmq_{M}_{n}_{k}_{cfg}{sp.sk_p or ''}" + ("_q6" if q6 != "false" else "") + ("" if has_min else "_nomin")
+  defines:dict[str, Any] = {"M_DIM": M, "N_DIM": n, "K_DIM": k, "BM": cfg.BM, "BN": cfg.BN, "WM": cfg.WM, "WN": cfg.WN,
+                            "STAGES": cfg.STAGES, "NBLK": cfg.NBLK, "GROUP_M": cfg.GROUP_M, "SK_P": sp.sk_p, "IS_Q6(bn)": f"({q6})",
+                            "HAS_MIN": int(has_min)}
+  if glu is not None:
+    suffix, gdefs = _glu_defines(glu)
+    name, defines = name + suffix, {**defines, **gdefs}
+  src = "".join(f"#define {kk} {v}\n" for kk, v in {**defines, "KNAME": name}.items()) + MMQ_SRC
+  threads, blocks = UOp.special(cfg.threads, "lidx0"), UOp.special(sp.grid, "gidx0")
+  io = M * k * 5 // 4 + n * k * 5 // 4 + int(C.shape[1]) * M * C.dtype.itemsize
+  est = Estimates(ops=2 * M * n * k, lds=io, mem=io)
+  sink = UOp.sink(C.base, X.base, W8.base, WS.base, SKWS.base, FLAGS.base, threads, blocks,
+                  arg=KernelInfo(name, estimates=est, dyn_shared_mem=cfg.smem))
+  return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src)))
+
+def nv_requant(segs:Sequence[QuantSeg], in_features:int, dep:Tensor, interleave:bool=False) -> tuple[Tensor, Tensor]|None:
+  """(int8 values (rows, in_features), float2 scales (rows, in_features/32, 2)) of the packed GGUF blocks of segs for nv_mmq, the rows
+  one after another (or alternating with interleave). Waits for dep like nv_dequant."""
+  N, K = sum(n for _, _, n in segs), in_features
+  if not segs or (N * K) % 4096 or not all(_seg_ok(seg, K, dep.device) for seg in segs): return None
+  if interleave and (len(segs) != 2 or segs[0][2] != segs[1][2]): return None
+  fxn = functools.partial(_quant_program, stage="REQUANT", k=K, ntok=0, segs=tuple((q, n) for _, q, n in segs), interleave=interleave)
+  w8, ws = Tensor.empty(N, K, dtype=dtypes.int8, device=dep.device), Tensor.empty(N, K // 32, 2, dtype=dtypes.float32, device=dep.device)
+  w8, ws = Tensor.custom_kernel(w8, ws, *(p for p, _, _ in segs), dep, fxn=fxn)[:2]
+  return w8, ws
+
+def nv_mmq(x:Tensor, segs:Sequence[QuantSeg], in_features:int, glu:Glu|None=None, interleave:bool=False) -> Tensor|None:
+  """x @ concat(W_i).T for prefill on GGUF Q4_K/Q6_K/Q8_0 weights with the int8 tensor core GEMM: x is quantized to int8 per 32 values
+  (like decode), the weights are requantized to int8 + per-block scales (exact), fp32 result (..., sum of rows). With glu (and
+  interleave: two segs, gate and up) the result (..., rows/2) is fp16 SwiGLU of their outputs. None if it doesn't apply."""
+  K, N = in_features, sum(n for _, _, n in segs)
+  if getenv("DISABLE_NV_MMQ") or not segs or not nv_gemm_supported(x.device) or x.uop.axis is not None or x.shape[-1] != K: return None
+  if x.dtype not in _CTYPE or K % MMQ.BK or N % MMQ.BN: return None
+  xs = x if isinstance(x.numel(), int) else x.pad_to(x.max_shape)
+  M = prod(xs.shape[:-1])
+  if not isinstance(M, int) or M < MMQ.BM: return None
+  Mp = -(-M // MMQ.BM) * MMQ.BM
+  if (Mp - M) * 8 > M: return None  # too much padding: the fp16 GEMM has smaller tiles
+  # tiles in a Q6_K segment take the two-scale path, decided per tile: a Q6_K segment's ends have to fall on tile boundaries
+  is6 = [q == Q6_K_TYPE for _, q, _ in segs]
+  if interleave:
+    if len(segs) != 2 or is6[0] != is6[1]: return None
+    bounds = [(0, N)] if is6[0] else []
+  else: bounds = [(a, a + n) for a, (_, _, n), q6s in zip(itertools.accumulate((n for _, _, n in segs), initial=0), segs, is6) if q6s]
+  if any(a % MMQ.BN or b % MMQ.BN for a, b in bounds): return None
+  q6 = " || ".join(f"(bn >= {a} && bn < {b})" for a, b in bounds) or "false"
+  x2 = xs.reshape(M, K)
+  if Mp != M: x2 = x2.pad(((0, Mp - M), None))
+  xq = _quantize_x(x2, Mp, K, None)
+  if (wq:=nv_requant(segs, K, xq, interleave)) is None: return None
+  sp = split(Mp, N, K, MMQ, num_sms(x.device))
+  skws = Tensor.empty(sp.sk_workers * MMQ.BM * MMQ.BN if sp.sk_workers else 1, dtype=dtypes.float32, device=x.device)
+  flags = _flags(x.device) if sp.sk_workers else Tensor.empty(1, dtype=dtypes.int32, device=x.device)
+  NO = N // 2 if glu is not None else N
+  out = Tensor.invalids(Mp, NO, dtype=dtypes.half if glu is not None else dtypes.float32, device=x.device)
+  fxn = functools.partial(_mmq_program, cfg=MMQ, sp=sp, k=K, n=N, q6=q6, has_min=any(q == 12 for _, q, _ in segs), glu=glu)
+  out = Tensor.custom_kernel(out, xq, *wq, skws, flags, fxn=fxn)[0]
+  if Mp != M: out = out[:M]
+  out = out.reshape(*xs.shape[:-1], NO)
+  return out if xs is x else out.shrink(tuple((0, s) for s in (*x.shape[:-1], NO)))
+
 _NORM_SRC:dict[UOp, tuple[Tensor, Tensor, float]] = {}
 def nv_note_rmsnorm(out:Tensor, x:Tensor, weight:Tensor, eps:float):
   """Record that out is RMSNorm(x) (x * rsqrt(mean(x^2) + eps) * weight over the last axis): a quant GEMV of out then quantizes
@@ -498,6 +589,8 @@ def _quantize_x(x:Tensor, tokens:int, K:int, glu:Glu|None) -> Tensor:
        asrc[2].nh * asrc[2].hd == K and asrc[2].nb == tokens:
     part, params, cfg = asrc
     xq = Tensor.custom_kernel(xq, part, params, fxn=functools.partial(fxn, attn=cfg))[0]
+  elif x.dtype == dtypes.half and glu is None:  # read as is (e.g. the prefill SwiGLU's fp16 output): no cast kernel
+    xq = Tensor.custom_kernel(xq, x.reshape(tokens, K).contiguous(), fxn=functools.partial(fxn, xtype=dtypes.half))[0]
   else: xq = Tensor.custom_kernel(xq, x.reshape(tokens, x.shape[-1]).float().contiguous(), fxn=fxn)[0]
   if len(_XQ_CACHE) >= 4: _XQ_CACHE.pop(next(iter(_XQ_CACHE)))
   _XQ_CACHE[key] = xq

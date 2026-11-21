@@ -330,6 +330,41 @@ class TestNVQuant(unittest.TestCase):
             ref = h @ lin.weight.float().numpy().T
             np.testing.assert_allclose(out.float().numpy(), ref, atol=0.015 * np.abs(ref).max(), rtol=0)
 
+  def test_mmq_prefill(self):
+    # prefill (>= 128 tokens) on the int8 GEMM: activations int8 per 32 values, weights requantized exactly; mixed formats in one
+    # launch (the Q6_K tiles take the two-scale path), a padded and a symbolic token count, and SwiGLU with a Q6_K down
+    from tinygrad.llm.kernels.amd import fused_linear, glu_ffn
+    from tinygrad.uop.ops import Ops
+    k, h = 1024, 2048
+    lins = self._shared_linears(((Q4_K, 256), (Q6_K, 128), (Q8_0, 128)), k, seed=50)
+    gate, up = self._shared_linears(((Q4_K, h), (Q4_K, h)), k, seed=60)
+    down = self._shared_linears(((Q6_K, k),), h, seed=70)[0]
+    wg, wu, wd = (lin.weight.float().numpy() for lin in (gate, up, down))
+    for tokens in (128, 200, 512):
+      with self.subTest(tokens=tokens):
+        x = np.random.default_rng(tokens).standard_normal((1, tokens, k)).astype(np.float32)
+        if tokens == 512:
+          names = [u.src[0].src[0].arg.name for u in Tensor.schedule_linear(*fused_linear(Tensor(x).realize(), *lins)).src
+                   if u.src[0].op is Ops.PROGRAM]
+          self.assertTrue(any(n.startswith("nv_q12x14x8_requant") for n in names) and any(n.startswith("nv_mmq_512_512_1024") for n in names),
+                          names)
+        for lin, out in zip(lins, fused_linear(Tensor(x), *lins)):
+          ref = x @ lin.weight.float().numpy().T
+          np.testing.assert_allclose(out.numpy(), ref, atol=0.02 * np.abs(ref).max(), rtol=0)
+        xg = x * (4 / np.std(x @ wg.T))
+        g, u = xg @ wg.T, xg @ wu.T
+        ref = (g / (1 + np.exp(-g)) * u) @ wd.T
+        out = glu_ffn(Tensor(xg), gate, up, down, lambda a, b: a * a.sigmoid() * b, (1.0, None, 0.0)).numpy()
+        np.testing.assert_allclose(out, ref, atol=0.02 * np.abs(ref).max(), rtol=0)
+    vt = UOp.variable("toks", 1, 512)
+    jf = TinyJit(lambda x: fused_linear(x, *lins)[0].pad_to((1, 512, 256)).realize())
+    for tokens in (512, 300):
+      with self.subTest(jit_tokens=tokens):
+        x = np.random.default_rng(tokens + 1).standard_normal((1, 512, k)).astype(np.float32)
+        out = jf(Tensor(x)[:, :vt.bind(tokens)].contiguous()).numpy()[:, :tokens]
+        ref = x[:, :tokens] @ lins[0].weight.float().numpy().T
+        np.testing.assert_allclose(out, ref, atol=0.02 * np.abs(ref).max(), rtol=0)
+
   def test_decode_attention_fused(self):
     # the output projection of flash decoding's output: its quantize kernel merges the attention splits (the merge kernel never
     # runs), for KV lengths that leave splits empty or fill all of them, batch 2, and a symbolic length under JIT

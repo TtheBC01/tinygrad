@@ -7,7 +7,7 @@ from tinygrad.helpers import prod, getenv, unwrap
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
 from tinygrad.llm.kernels.nv import nv_linear, nv_quant_gemv, nv_dequant, nv_gemm_supported, nv_note_rmsnorm, NV_QUANT_UNIT, NV_QUANT_MAX_TOKENS
-from tinygrad.llm.kernels.nv import QuantSeg, Glu
+from tinygrad.llm.kernels.nv import nv_mmq, QuantSeg, Glu
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -162,7 +162,9 @@ def _nv_fused(x:Tensor, lins:Sequence[Linear]) -> tuple[Tensor, bool]|None:
   segs = [seg for l in lins if (seg:=l._nv_quant_seg()) is not None]
   if len(segs) != len(lins): return None
   if (out:=nv_quant_gemv(x, segs, K)) is not None: return out, True
-  # prefill: the GEMM takes the shape and dtype from this placeholder (never realized), the weight from nv_dequant
+  # prefill: the int8 GEMM on the requantized blocks (fp32 out), else the fp16 GEMM, which takes the shape and dtype from this
+  # placeholder (never realized) and the weight from nv_dequant
+  if (out:=nv_mmq(x, segs, K)) is not None: return out, False
   weight = Tensor.empty(sum(n for _, _, n in segs), K, dtype=dtypes.half, device=x.device)
   return None if (out:=nv_linear(x, weight, functools.partial(nv_dequant, segs, K))) is None else (out, False)
 
@@ -188,11 +190,14 @@ def _nv_glu_prefill(x:Tensor, gate:Linear, up:Linear, down:Linear, glu:Glu) -> T
   # a symbolic token count: run both GEMMs on the padded rows and slice once at the end (slicing the activation and padding it
   # again for down would copy it)
   xs = x if isinstance(tokens, int) else x.pad_to(x.max_shape)
-  act = nv_linear(xs, Tensor.empty(2 * H, K, dtype=dtypes.half, device=x.device), functools.partial(nv_dequant, [s0, s1], K, interleave=True),
-                  glu=glu)
+  # the int8 GEMMs, else the fp16 ones on dequantized weights
+  if (act:=nv_mmq(xs, [s0, s1], K, glu=glu, interleave=True)) is None:
+    act = nv_linear(xs, Tensor.empty(2 * H, K, dtype=dtypes.half, device=x.device),
+                    functools.partial(nv_dequant, [s0, s1], K, interleave=True), glu=glu)
   if act is None: return None
-  out = nv_linear(act, Tensor.empty(down.out_features, H, dtype=dtypes.half, device=x.device), functools.partial(nv_dequant, [sd], H),
-                  out_dtype=x.dtype)
+  if (out:=nv_mmq(act, [sd], H)) is not None: out = out.cast(x.dtype)
+  else: out = nv_linear(act, Tensor.empty(down.out_features, H, dtype=dtypes.half, device=x.device), functools.partial(nv_dequant, [sd], H),
+                        out_dtype=x.dtype)
   if out is None: return None
   return down._nv_out(out if xs is x else out.shrink(tuple((0, s) for s in (*x.shape[:-1], down.out_features))))
 

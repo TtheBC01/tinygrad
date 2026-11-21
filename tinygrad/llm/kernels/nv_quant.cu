@@ -282,3 +282,66 @@ extern "C" __global__ void __launch_bounds__(128) KNAME(half *__restrict__ OUT, 
   *(uint4 *)(OUT + i8 * 8) = *(uint4 *)o;
 }
 #endif
+
+#ifdef REQUANT
+// Prefill on quant weights with the int8 GEMM (nv_mmq.cu): each 32-weight block as int8 values and a float2, w = s*q - m for Q8_0 /
+// Q4_K ((s, m), m = 0 for Q8_0) or one scale per 16 for Q6_K ((s_lo, s_hi), q = 6-bit value - 32). Exact: no rounding.
+// grid (N_OUT * K / 32 / 128), 128 threads: one block per thread. W8: [N_OUT][K] int8, WS: [N_OUT][K/32] float2, the segments'
+// rows one after another or alternating (SEG_DISPATCH calls requant32 on the segment that owns the row). DEP as DEQUANT's.
+template <int QT> __device__ __forceinline__ void requant32(const unsigned char *wr, int blk, unsigned (&q)[8], float2 &sc);
+template <> __device__ __forceinline__ void requant32<12>(const unsigned char *wr, int blk, unsigned (&q)[8], float2 &sc) {
+  const unsigned char *b = wr + (size_t)(blk / 8) * 144;
+  const int j = blk % 8;  // sub-block: low nibbles of qs[32 (j/2) ..] for even j, high for odd
+  const float d = __half2float(*(const half *)b), dmin = __half2float(*(const half *)(b + 2));
+  const unsigned char *scs = b + 4;
+  const int s = j < 4 ? scs[j] & 63 : (scs[j + 4] & 0xF) | ((scs[j - 4] >> 6) << 4);
+  const int m = j < 4 ? scs[j + 4] & 63 : (scs[j + 4] >> 4) | ((scs[j] >> 6) << 4);
+  const uint4 *qs = (const uint4 *)(b + 16 + 32 * (j / 2));  // 16-byte aligned: superblocks are 144 bytes from an aligned row
+#pragma unroll
+  for (int i = 0; i < 2; i++) {
+    const uint4 u = qs[i];
+    const unsigned w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+    for (int k = 0; k < 4; k++) q[4 * i + k] = (w[k] >> (4 * (j & 1))) & 0x0F0F0F0F;
+  }
+  sc = make_float2(d * s, dmin * m);
+}
+template <> __device__ __forceinline__ void requant32<14>(const unsigned char *wr, int blk, unsigned (&q)[8], float2 &sc) {
+  const unsigned char *b = wr + (size_t)(blk / 8) * 210;
+  const int t = (blk % 8) * 32, h = t / 128, qd = (t % 128) / 32;  // as dequant8<14>, for l = 0..31
+  const float d = __half2float(*(const half *)(b + 208));
+  const signed char *scs = (const signed char *)b + 192 + 8 * h + 2 * qd;
+  const unsigned char *ql = b + 64 * h + 32 * (qd & 1), *qh = b + 128 + 32 * h;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    unsigned v = 0;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+      const int l = 4 * i + k, lo = (ql[l] >> (4 * (qd >> 1))) & 0xF, hb = (qh[l] >> (2 * qd)) & 3;
+      v |= (unsigned)(((lo | (hb << 4)) - 32) & 0xFF) << (8 * k);
+    }
+    q[i] = v;
+  }
+  sc = make_float2(d * scs[0], d * scs[1]);
+}
+template <> __device__ __forceinline__ void requant32<8>(const unsigned char *wr, int blk, unsigned (&q)[8], float2 &sc) {
+  const unsigned char *b = wr + (size_t)blk * 34;
+  const unsigned short *h = (const unsigned short *)(b + 2);  // 2-byte aligned
+#pragma unroll
+  for (int i = 0; i < 8; i++) q[i] = (unsigned)h[2 * i] | ((unsigned)h[2 * i + 1] << 16);
+  sc = make_float2(__half2float(*(const half *)b), 0.0f);
+}
+
+extern "C" __global__ void __launch_bounds__(128) KNAME(unsigned char *__restrict__ W8, float2 *__restrict__ WS, SEG_PARAMS, const void *DEP) {
+  const size_t i = (size_t)blockIdx.x * 128 + threadIdx.x;  // block of 32 weights
+  const int row = (int)(i / (K_DIM / 32)), blk = (int)(i % (K_DIM / 32));
+  unsigned q[8];
+  float2 sc;
+  SEG_DISPATCH
+  uint4 *o = (uint4 *)(W8 + i * 32);
+  o[0] = make_uint4(q[0], q[1], q[2], q[3]);
+  o[1] = make_uint4(q[4], q[5], q[6], q[7]);
+  WS[i] = sc;
+}
+#endif
+
