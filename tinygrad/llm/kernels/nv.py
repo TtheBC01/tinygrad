@@ -12,8 +12,8 @@ With Cfg.SK (default), tiles that would leave the last wave partly empty are spl
 which needs a small fp32 workspace and a zeroed flag buffer per call.
 Run as a script for a correctness check: DEV=NV python -m tinygrad.llm.kernels.nv
 """
-import ctypes, functools, pathlib
-from typing import Any, Callable
+import ctypes, functools, hashlib, pathlib
+from typing import Any, Callable, Sequence
 from dataclasses import dataclass
 from tinygrad import Tensor, dtypes, Device, Context
 from tinygrad.dtype import DType
@@ -303,66 +303,106 @@ NV_QUANT_STEP = {Q8_0: 512, Q4_K: 1024, Q6_K: 1024}  # weights per warp per loop
 NV_QUANT_ALIGN = {Q8_0: 8, Q4_K: 16, Q6_K: 8}  # byte alignment of the weights the kernel's loads need (Q4_K: 128-bit loads)
 NV_QUANT_MAX_TOKENS = 8  # each warp keeps one accumulator per token; prefill dequantizes to fp16 for the GEMM instead
 
+QuantSeg = tuple[Tensor, int, int]  # one weight of a GEMV or dequant launch: (packed blocks, ggml type, rows)
+Glu = tuple[float, float|None, float]  # model.gated_activation's SwiGLU: (alpha, limit or None, up_bias)
+
 def _byte_offset(t:Tensor) -> int|None:
   # offset of t's data in its buffer, in bytes (a GGUF tensor is a view into the whole file's buffer)
   return None if (view:=t.uop.contiguous_view()) is None else view[1] * view[0].dtype.itemsize
 
-def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, n:int=0, qtype:int=0, ksplit:int=1) -> UOp:
+def _seg_ok(seg:QuantSeg, k:int, device:str|tuple[str, ...]|None) -> bool:
+  packed, qtype, n = seg
+  return qtype in NV_QUANT_UNIT and k % NV_QUANT_UNIT[qtype] == 0 and packed.device == device and packed.uop.axis is None and \
+    packed.nbytes() == int(n * k * NV_QUANT_BYTES[qtype])
+
+def _seg_source(segs:tuple[tuple[int, int], ...], stage:str, ksplit:int) -> dict[str, str]:
+  # SEG_PARAMS and SEG_DISPATCH for nv_quant.cu: the weight pointers, and which weight a GEMV block / DEQUANT thread works on
+  params = ", ".join(f"const unsigned char *__restrict__ W{i}" for i in range(len(segs)))
+  calls, start, col = [], 0, 0
+  for i, (qtype, n) in enumerate(segs):
+    if stage == "GEMV":
+      end = start + -(-n // (4 // ksplit))
+      calls.append(f"if (blk < {end}) gemv_rows<{qtype}, {n}>(OUT + {col}, W{i}, XQ, blk - {start}, part);")
+    else:
+      end = start + n
+      call = f"dequant8<{qtype}>(W{i} + (size_t)(row - {start}) * QRow<{qtype}>::BYTES, col, v);"
+      calls.append(call if i == len(segs) - 1 else f"if (row < {end}) {call}")
+    start, col = end, col + n
+  return {"SEG_PARAMS": params, "SEG_DISPATCH": " else ".join(calls)}
+
+def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, segs:tuple[tuple[int, int], ...]=(), ksplit:int=1,
+                   glu:Glu|None=None) -> UOp:
+  qts, ns, ntot = "x".join(str(q) for q, _ in segs), "x".join(str(n) for _, n in segs), sum(n for _, n in segs)
+  wbytes = int(sum(n * k * NV_QUANT_BYTES[q] for q, n in segs))
   if stage == "DEQUANT":
-    name, defines = f"nv_q{qtype}_dequant_{n}_{k}", {"DEQUANT": 1, "QTYPE": qtype}
-    dims = (UOp.special(128, "lidx0"), UOp.special(n * k // 1024, "gidx0"))
-    io = int(n * k * (NV_QUANT_BYTES[qtype] + 2))
-    est = Estimates(ops=3 * n * k, lds=io, mem=io)
+    name, defines = f"nv_q{qts}_dequant_{ns}_{k}", {"DEQUANT": 1, "N_OUT": ntot, **_seg_source(segs, stage, ksplit)}
+    dims = (UOp.special(128, "lidx0"), UOp.special(ntot * k // 1024, "gidx0"))
+    io = wbytes + ntot * k * 2
+    est = Estimates(ops=3 * ntot * k, lds=io, mem=io)
   elif stage == "QUANTIZE":
     name, defines = f"nv_q8_quantize_{ntok}_{k}", {"QUANTIZE": 1}
+    if glu is not None:
+      alpha, limit, up_bias = glu
+      name += "_glu" + ("" if glu == (1.0, None, 0.0) else hashlib.md5(repr(glu).encode()).hexdigest()[:6])
+      defines.update({"GLU": 1, "GLU_ALPHA": f"{alpha!r}f", "GLU_UP_BIAS": f"{up_bias!r}f"})
+      if limit is not None: defines["GLU_LIMIT"] = f"{limit!r}f"
     dims = (UOp.special(128, "lidx0"), UOp.special(ntok * k // 128, "gidx0"))
-    io = ntok * k * (4 + 1)
-    est = Estimates(ops=3 * ntok * k, lds=io, mem=io)
+    io = ntok * k * (4 * (2 if glu else 1) + 1)
+    est = Estimates(ops=(10 if glu else 3) * ntok * k, lds=io, mem=io)
   else:
-    name, defines = f"nv_q{qtype}_gemv_{ntok}_{n}_{k}_ks{ksplit}", {"GEMV": 1, "QTYPE": qtype, "N_DIM": n, "NTOK": ntok, "KSPLIT": ksplit}
-    dims = (UOp.special(128, "lidx0"), UOp.special(-(-n // (4 // ksplit)), "gidx0"))
-    io = int(n * k * NV_QUANT_BYTES[qtype]) + ntok * (k + 4 * n)
-    est = Estimates(ops=2 * ntok * n * k, lds=io, mem=io)
+    name = f"nv_q{qts}_gemv_{ntok}_{ns}_{k}_ks{ksplit}"
+    defines = {"GEMV": 1, "N_OUT": ntot, "NTOK": ntok, "KSPLIT": ksplit, **_seg_source(segs, stage, ksplit)}
+    dims = (UOp.special(128, "lidx0"), UOp.special(sum(-(-n // (4 // ksplit)) for _, n in segs), "gidx0"))
+    io = wbytes + ntok * (k + 4 * ntot)
+    est = Estimates(ops=2 * ntok * ntot * k, lds=io, mem=io)
   src = "".join(f"#define {kk} {v}\n" for kk, v in {**defines, "KNAME": name, "K_DIM": k}.items()) + QUANT_SRC
   sink = UOp.sink(OUT.base, *[x.base for x in srcs], *dims, arg=KernelInfo(name, estimates=est))
   return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src)))
 
+def nv_quant_gemv(x:Tensor, segs:Sequence[QuantSeg], in_features:int, glu:Glu|None=None) -> Tensor|None:
+  """x @ concat(W_0, W_1, ...).T in fp32 for a few tokens, each W_i (rows_i, in_features) stored as packed GGUF blocks (Q4_K, Q6_K or
+  Q8_0, as find_packed returns them): one launch for weights that share their input. With glu, x is (..., 2 * in_features), the
+  output of a fused gate/up nv_quant_gemv, and the input is its gated activation (model.gated_activation's SwiGLU with glu's
+  (alpha, limit, up_bias)) instead. None if the kernel doesn't apply."""
+  K = in_features
+  if not segs or not nv_gemm_supported(x.device) or x.uop.axis is not None or x.shape[-1] != (2 * K if glu else K): return None
+  if glu is not None and x.dtype != dtypes.float32: return None
+  tokens = prod(x.shape[:-1])
+  if not isinstance(tokens, int) or not 1 <= tokens <= NV_QUANT_MAX_TOKENS or K % 128: return None
+  for seg in segs:
+    if not _seg_ok(seg, K, x.device) or (off:=_byte_offset(seg[0])) is None or off % NV_QUANT_ALIGN[seg[1]]: return None
+  # split each row's K over up to 4 warps when there are too few rows to keep every SM streaming (~64 warps per SM: a long row
+  # per warp leaves the SMs idle at the end, bench/quant_bench.py)
+  N, step, ksplit = sum(n for _, _, n in segs), max(NV_QUANT_STEP[q] for _, q, _ in segs), 1
+  while ksplit < 4 and N * ksplit < getenv("NV_QUANT_WARPS_PER_SM", 64) * num_sms(x.device) and K // step >= 2 * ksplit: ksplit *= 2
+  fxn = functools.partial(_quant_program, stage="GEMV", k=K, ntok=tokens, segs=tuple((q, n) for _, q, n in segs), ksplit=ksplit)
+  out = Tensor.custom_kernel(Tensor.empty(tokens, N, dtype=dtypes.float32, device=x.device), *(p for p, _, _ in segs),
+                             _quantize_x(x, tokens, K, glu), fxn=fxn)[0]
+  return out.reshape(*x.shape[:-1], N)
+
 def nv_quant_linear(x:Tensor, packed:Tensor, qtype:int, out_features:int, in_features:int) -> Tensor|None:
   """x @ W.T for a few tokens, W (out_features, in_features) stored as packed GGUF blocks of type qtype (Q4_K, Q6_K or Q8_0,
   as find_packed returns them). The result is in x's dtype (accumulated in fp32), or None if the kernel doesn't apply."""
-  if qtype not in NV_QUANT_UNIT or not nv_gemm_supported(x.device) or x.device != packed.device: return None
-  if x.uop.axis is not None or packed.uop.axis is not None or x.shape[-1] != in_features: return None
-  tokens, N, K = prod(x.shape[:-1]), out_features, in_features
-  if not isinstance(tokens, int) or not 1 <= tokens <= NV_QUANT_MAX_TOKENS or K % NV_QUANT_UNIT[qtype] or K % 128: return None
-  if packed.nbytes() != int(N * K * NV_QUANT_BYTES[qtype]): return None
-  if (off:=_byte_offset(packed)) is None or off % NV_QUANT_ALIGN[qtype]: return None
-  # split each row's K over up to 4 warps when there are too few rows to keep every SM streaming (~64 warps per SM: a long row
-  # per warp leaves the SMs idle at the end, bench/quant_bench.py)
-  ksplit = 1
-  while ksplit < 4 and N * ksplit < getenv("NV_QUANT_WARPS_PER_SM", 64) * num_sms(x.device) and K // NV_QUANT_STEP[qtype] >= 2 * ksplit: ksplit *= 2
-  prg = functools.partial(_quant_program, k=K, ntok=tokens)
-  out = Tensor.empty(tokens, N, dtype=dtypes.float32, device=x.device)
-  out = Tensor.custom_kernel(out, packed, _quantize_x(x, tokens, K), fxn=functools.partial(prg, stage="GEMV", n=N, qtype=qtype, ksplit=ksplit))[0]
-  return out.reshape(*x.shape[:-1], N).cast(x.dtype)
+  return None if (out:=nv_quant_gemv(x, [(packed, qtype, out_features)], in_features)) is None else out.cast(x.dtype)
 
-def nv_dequant(packed:Tensor, qtype:int, out_features:int, in_features:int, dep:Tensor) -> Tensor|None:
-  """The (out_features, in_features) fp16 weight of packed GGUF blocks (Q4_K, Q6_K or Q8_0), or None if unsupported.
-  The kernel waits for dep (the layer's input, otherwise unused) so each layer's copy is made right before its GEMM."""
-  N, K = out_features, in_features
-  if qtype not in NV_QUANT_UNIT or K % NV_QUANT_UNIT[qtype] or (N * K) % 1024 or packed.nbytes() != int(N * K * NV_QUANT_BYTES[qtype]): return None
-  out = Tensor.empty(N, K, dtype=dtypes.half, device=packed.device)
-  return Tensor.custom_kernel(out, packed, dep, fxn=functools.partial(_quant_program, stage="DEQUANT", k=K, ntok=0, n=N, qtype=qtype))[0]
+def nv_dequant(segs:Sequence[QuantSeg], in_features:int, dep:Tensor) -> Tensor|None:
+  """The (sum of rows, in_features) fp16 weight of the packed GGUF blocks (Q4_K, Q6_K or Q8_0) of segs, one after another, or None
+  if unsupported. The kernel waits for dep (the layer's input, otherwise unused) so each layer's copy is made right before its GEMM."""
+  N, K = sum(n for _, _, n in segs), in_features
+  if not segs or (N * K) % 1024 or not all(_seg_ok(seg, K, dep.device) for seg in segs): return None
+  fxn = functools.partial(_quant_program, stage="DEQUANT", k=K, ntok=0, segs=tuple((q, n) for _, q, n in segs))
+  return Tensor.custom_kernel(Tensor.empty(N, K, dtype=dtypes.half, device=dep.device), *(p for p, _, _ in segs), dep, fxn=fxn)[0]
 
-_XQ_CACHE:dict[UOp, Tensor] = {}
-def _quantize_x(x:Tensor, tokens:int, K:int) -> Tensor:
-  # int8 activations for the GEMV. The q/k/v projections (and gate/up) take the same x one after another: quantize it once.
+_XQ_CACHE:dict[tuple[UOp, Glu|None], Tensor] = {}
+def _quantize_x(x:Tensor, tokens:int, K:int, glu:Glu|None) -> Tensor:
+  # int8 activations for the GEMV. Linears that take the same x one after another (when not fused) quantize it once.
   # (A fresh Tensor.empty output per call would make each quantization a distinct kernel.) Keyed on the UOp, a few entries.
-  if (xq:=_XQ_CACHE.get(x.uop)) is not None: return xq
+  if (xq:=_XQ_CACHE.get(key:=(x.uop, glu))) is not None: return xq
   xq = Tensor.empty(tokens * (K // 4 + K // 16), dtype=dtypes.int32, device=x.device)
-  xq = Tensor.custom_kernel(xq, x.reshape(tokens, K).float().contiguous(),
-                            fxn=functools.partial(_quant_program, stage="QUANTIZE", k=K, ntok=tokens))[0]
+  xq = Tensor.custom_kernel(xq, x.reshape(tokens, x.shape[-1]).float().contiguous(),
+                            fxn=functools.partial(_quant_program, stage="QUANTIZE", k=K, ntok=tokens, glu=glu))[0]
   if len(_XQ_CACHE) >= 4: _XQ_CACHE.pop(next(iter(_XQ_CACHE)))
-  _XQ_CACHE[x.uop] = xq
+  _XQ_CACHE[key] = xq
   return xq
 
 def ampere_matmul(a:Tensor, b:Tensor, cfg:Cfg|None=None) -> Tensor:

@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import fused_linear, glu_ffn
 from tinygrad.llm.kernels.nv import nv_flash_attention
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
@@ -339,7 +340,11 @@ class FFNBlock:
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
-    return self.ffn_down(gated_activation(self.ffn_gate(x), self.ffn_up(x), self.config))
+    # NV/CUDA on GGUF quant weights: gate and up in one kernel, and in decode the activation folded into ffn_down's input
+    c = self.config
+    limit = c.swiglu_limit if c.swiglu_limit is not None and c.swiglu_limit > 0 else None
+    glu = None if c.situ is not None else (c.swiglu_alpha, limit, c.swiglu_up_bias)
+    return glu_ffn(x, self.ffn_gate, self.ffn_up, self.ffn_down, functools.partial(gated_activation, config=c), glu)
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
@@ -386,7 +391,7 @@ class TransformerBlock(FFNBlock):
     self.indexer = Indexer(config) if config.indexer else None
 
   def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None) -> Tensor:
-    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    q, k, v = fused_linear(x, self.attn_q, self.attn_k, self.attn_v)  # one kernel on NV/CUDA for GGUF quant weights
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape

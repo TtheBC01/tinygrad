@@ -1,12 +1,12 @@
 from __future__ import annotations
-import functools, math
-from typing import cast
+import functools, itertools, math
+from typing import Callable, Sequence, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, unwrap
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
-from tinygrad.llm.kernels.nv import nv_linear, nv_quant_linear, nv_dequant, nv_gemm_supported, NV_QUANT_UNIT
+from tinygrad.llm.kernels.nv import nv_linear, nv_quant_gemv, nv_dequant, nv_gemm_supported, NV_QUANT_UNIT, QuantSeg, Glu
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -93,13 +93,20 @@ class Linear(nn.Linear):
         w = self.weight if self.rope_source is None else self.rope_source[0]
         self._nv_packed_cache = find_packed(w, self.in_features)
     return self._nv_packed_cache
-  def _rope_permute_out(self, out:Tensor) -> Tensor:
-    # model.permute_rope on the output features: the same reordering the loader applied to the weight's rows
-    if self.rope_source is None: return out
-    _, n_heads, rope_dim = self.rope_source
-    x = out.reshape(*out.shape[:-1], n_heads, self.out_features // n_heads)
-    prefix = x.shape[-1] - rope_dim
-    return x[..., :prefix].cat(x[..., prefix:].rearrange("... (h two) -> ... (two h)", two=2), dim=-1).reshape(out.shape)
+  def _nv_quant_seg(self) -> QuantSeg|None:
+    # this layer's weight for the NV GEMV / dequant kernels (GGUF Q4_K, Q6_K or Q8_0 blocks), or None if they can't take it
+    if self.groups != 1 or self.ggml_type is not None or self.weight_scale_inv is not None or not nv_gemm_supported(self.weight.device): return None
+    if (packed:=self._nv_packed()) is None or packed[0] not in NV_QUANT_UNIT: return None
+    return packed[1], packed[0], self.out_features
+  def _nv_out(self, out:Tensor) -> Tensor:
+    # finish a kernel's output read from the packed blocks: model.permute_rope on the output features (the same reordering the
+    # loader applied to the weight's rows), then the bias
+    if self.rope_source is not None:
+      _, n_heads, rope_dim = self.rope_source
+      x = out.reshape(*out.shape[:-1], n_heads, self.out_features // n_heads)
+      prefix = x.shape[-1] - rope_dim
+      out = x[..., :prefix].cat(x[..., prefix:].rearrange("... (h two) -> ... (two h)", two=2), dim=-1).reshape(out.shape)
+    return out if self.bias is None else out + self.bias
   def __call__(self, x:Tensor) -> Tensor:
     from tinygrad.llm.kernels.amd_gguf import QUANT_SIZES, q8_linear
     if self.weight_scale_inv is not None:
@@ -128,17 +135,49 @@ class Linear(nn.Linear):
     # prefill-sized matmuls run on the hand-written tensor core GEMM, on dense fp16 weights or Q4_K/Q6_K/Q8_0 ones dequantized
     # to fp16 right before (other quant types keep tinygrad's matmul, which dequantizes as it reads)
     if self.groups == 1 and self.ggml_type is None and nv_gemm_supported(self.weight.device):
-      if (packed:=self._nv_packed()) is None: nv_out = nv_linear(x, _view_back(self.weight))
-      elif packed[0] not in NV_QUANT_UNIT: nv_out = None
-      elif (nv_out:=nv_quant_linear(x, packed[1], packed[0], self.out_features, self.in_features)) is None:
-        nv_out = nv_linear(x, self.weight, functools.partial(nv_dequant, packed[1], packed[0], self.out_features, self.in_features))
-      if nv_out is not None:
-        if packed is not None: nv_out = self._rope_permute_out(nv_out)
+      if self._nv_quant_seg() is not None:
+        if (fused:=_nv_fused(x, [self])) is not None: return self._nv_out(fused[0].cast(x.dtype))
+      elif self._nv_packed() is None and (nv_out:=nv_linear(x, _view_back(self.weight))) is not None:
         return nv_out if self.bias is None else nv_out + self.bias
     if self.groups > 1:
       out = (x.unsqueeze(-2) @ self.weight.reshape(self.groups, -1, self.in_features).transpose(-1, -2)).squeeze(-2)
       return out if self.bias is None else out + self.bias.reshape(self.groups, -1)
     return super().__call__(x)
+
+def _nv_fused(x:Tensor, lins:Sequence[Linear]) -> tuple[Tensor, bool]|None:
+  """(x @ concat(weights).T, decode) for Linears that share x and whose weights are GGUF Q4_K/Q6_K/Q8_0 blocks, as one NV kernel:
+  the GEMV on the packed blocks for a few tokens (decode, fp32 result), else one dequantize into a single fp16 weight and one GEMM
+  (x's dtype). Before bias and RoPE output permutation (Linear._nv_out). None if a weight or x doesn't fit."""
+  K = lins[0].in_features
+  if any(l.in_features != K for l in lins) or (len(lins) > 1 and getenv("DISABLE_NV_FUSE")): return None
+  segs = [seg for l in lins if (seg:=l._nv_quant_seg()) is not None]
+  if len(segs) != len(lins): return None
+  if (out:=nv_quant_gemv(x, segs, K)) is not None: return out, True
+  # prefill: the GEMM takes the shape and dtype from this placeholder (never realized), the weight from nv_dequant
+  weight = Tensor.empty(sum(n for _, _, n in segs), K, dtype=dtypes.half, device=x.device)
+  return None if (out:=nv_linear(x, weight, functools.partial(nv_dequant, segs, K))) is None else (out, False)
+
+def _nv_split(out:Tensor, lins:Sequence[Linear], dtype) -> list[Tensor]:
+  offs = [0, *itertools.accumulate(l.out_features for l in lins)]
+  return [l._nv_out(out[..., a:b].cast(dtype)) for l, a, b in zip(lins, offs, offs[1:])]
+
+def fused_linear(x:Tensor, *lins:Linear) -> list[Tensor]:
+  """[lin(x) for lin in lins]. On NV/CUDA with GGUF Q4_K/Q6_K/Q8_0 weights (e.g. attention's q/k/v) it's one GEMV launch in decode,
+  one dequantize and one GEMM in prefill."""
+  if (fused:=_nv_fused(x, lins)) is not None: return _nv_split(fused[0], lins, x.dtype)
+  return [l(x) for l in lins]
+
+def glu_ffn(x:Tensor, gate:Linear, up:Linear, down:Linear, act:Callable[[Tensor, Tensor], Tensor], glu:Glu|None) -> Tensor:
+  """down(act(gate(x), up(x))). On NV/CUDA with GGUF Q4_K/Q6_K/Q8_0 weights gate and up run as one kernel (fused_linear), and in
+  decode act is applied in down's activation quantization when glu gives its SwiGLU constants (None: act is something else)."""
+  if (fused:=_nv_fused(x, (gate, up))) is None: return down(act(gate(x), up(x)))
+  gu, decode = fused
+  H = gate.out_features
+  if decode and glu is not None and up.out_features == H == down.in_features and gate.bias is None and up.bias is None and \
+     gate.rope_source is None and up.rope_source is None and (seg:=down._nv_quant_seg()) is not None and \
+     (out:=nv_quant_gemv(gu, [seg], H, glu=glu)) is not None:
+    return down._nv_out(out.cast(x.dtype))
+  return down(act(*_nv_split(gu, (gate, up), x.dtype)))
 
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""

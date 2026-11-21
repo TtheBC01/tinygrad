@@ -226,6 +226,72 @@ class TestNVQuant(unittest.TestCase):
     order = [nm.split("_")[0] + ("_dequant" if "dequant" in nm else "") for nm in names]
     self.assertEqual(order, ["nv_dequant", "ampere", "nv_dequant", "ampere"])
 
+  def _shared_linears(self, specs, k, seed=0, bias=False):
+    # Linears whose weights are GGUF blocks of the given (qtype, rows), stored back to back in one buffer like a GGUF file
+    raws = [_quant_blocks(qtype, n, k, seed=seed + i) for i, (qtype, n) in enumerate(specs)]
+    pads = [(-sum(len(r) for r in raws[:i]) - 64) % 16 for i in range(len(raws))]  # 16-byte aligned starts (Q4_K), after a header
+    buf = Tensor(np.concatenate([np.zeros(64, np.uint8)] + [np.concatenate([np.zeros(p, np.uint8), r]) for p, r in zip(pads, raws)])).realize()
+    lins, off = [], 64
+    for (qtype, n), p, raw in zip(specs, pads, raws):
+      off += p
+      lin = Linear(k, n, bias=bias)
+      lin.weight = ggml_data_to_tensor(buf[off:off+len(raw)], n * k, qtype).reshape(n, k).cast(dtypes.half)
+      if bias: lin.bias = Tensor(np.random.default_rng(seed + n).standard_normal(n).astype(np.float32)).realize()
+      assert lin._nv_quant_seg() is not None
+      lins.append(lin)
+      off += len(raw)
+    return lins
+
+  def test_fused_linear(self):
+    # one GEMV (decode) or one dequantize + GEMM (prefill) for weights of different types and row counts (blocks of a segment
+    # boundary are partly idle), views into one buffer, with biases; the same as each Linear on its own
+    from tinygrad.llm.kernels.amd import fused_linear
+    k = 1024
+    for specs in (((Q4_K, 96), (Q6_K, 36), (Q8_0, 64)), ((Q4_K, 2048), (Q4_K, 512), (Q6_K, 512)), ((Q8_0, 100), (Q8_0, 28))):
+      lins = self._shared_linears(specs, k, bias=True)
+      for tokens in (1, 3, 32):
+        with self.subTest(specs=specs, tokens=tokens):
+          x = np.random.default_rng(7).standard_normal((1, tokens, k)).astype(np.float32)
+          outs = fused_linear(Tensor(x), *lins)
+          for lin, out in zip(lins, outs):
+            ref = x @ lin.weight.float().numpy().T + lin.bias.numpy()
+            np.testing.assert_allclose(out.numpy(), ref, atol=0.01 * np.abs(ref).max(), rtol=0)
+
+  def test_fused_kernel_count(self):
+    # decode: q/k/v in one quantize and one GEMV; prefill: one dequantize and one GEMM
+    from tinygrad.llm.kernels.amd import fused_linear
+    from tinygrad.uop.ops import Ops
+    lins = self._shared_linears(((Q4_K, 512), (Q4_K, 128), (Q6_K, 128)), 1024)
+    for tokens, expect in ((1, ["nv_q8_quantize", "nv_q12x12x14_gemv"]), (64, ["nv_q12x12x14_dequant", "ampere"])):
+      with self.subTest(tokens=tokens):
+        outs = fused_linear(Tensor.randn(1, tokens, 1024).realize(), *lins)
+        names = [u.src[0].src[0].arg.name for u in Tensor.schedule_linear(*outs).src if u.src[0].op is Ops.PROGRAM]
+        kinds = [next((e for e in expect if nm.startswith(e)), nm) for nm in names if nm.startswith(("nv_", "ampere"))]
+        self.assertEqual(kinds, expect)
+
+  def test_glu_ffn(self):
+    # down(gated_activation(gate(x), up(x))): in decode the activation runs in down's input quantization; Llama's SwiGLU and the
+    # gpt-oss form (alpha 1.702, clamp 7, up bias 1)
+    from tinygrad.llm.kernels.amd import glu_ffn
+    k, h = 1024, 2048
+    for qtypes, glu in (((Q4_K, Q4_K, Q6_K), (1.0, None, 0.0)), ((Q8_0, Q8_0, Q8_0), (1.702, 7.0, 1.0))):
+      gate, up = self._shared_linears(((qtypes[0], h), (qtypes[1], h)), k, seed=10)
+      down = self._shared_linears(((qtypes[2], k),), h, seed=20)[0]
+      alpha, limit, up_bias = glu
+      def act(g:Tensor, u:Tensor) -> Tensor:
+        if limit is not None: g, u = g.clamp(max_=limit), u.clamp(-limit, limit)
+        return g * (g * alpha).sigmoid() * (u + up_bias)
+      wg, wu, wd = (lin.weight.float().numpy() for lin in (gate, up, down))
+      for tokens in (1, 2, 32):
+        with self.subTest(qtypes=qtypes, tokens=tokens):
+          x = np.random.default_rng(8).standard_normal((1, tokens, k)).astype(np.float32)
+          x *= 4 / np.std(x @ wg.T)  # gate pre-activations ~4: through the sigmoid's curve and the clamp, and fp16 range in prefill
+          g, u = x @ wg.T, x @ wu.T
+          if limit is not None: g, u = np.minimum(g, limit), np.clip(u, -limit, limit)
+          ref = (g / (1 + np.exp(-alpha * g)) * (u + up_bias)) @ wd.T
+          out = glu_ffn(Tensor(x), gate, up, down, act, glu).numpy()
+          np.testing.assert_allclose(out, ref, atol=0.02 * np.abs(ref).max(), rtol=0)
+
   def test_unsupported_type(self):
     self.assertIsNone(nv_quant_linear(Tensor.empty(1, 256), Tensor.empty(256 * 84 // 256, dtype=dtypes.uint8), 10, 1, 256))  # Q2_K
 
