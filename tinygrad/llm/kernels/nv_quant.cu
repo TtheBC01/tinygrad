@@ -53,8 +53,9 @@ extern "C" __global__ void __launch_bounds__(128) KNAME(int *__restrict__ XQ, co
 #elif defined(ATTN)
   static_assert(HD % 32 == 0, "a block of 32 values lies in one head");
   const int h = b * 32 / HD;
-  const float v = decode_merge<NSPLIT>(X + ((size_t)t * (K_DIM / HD) + h) * NSPLIT * (HD + 2), decode_active_splits(params[0], NSPLIT, MINKEYS),
-                               HD, lane, b * 32 % HD + lane);
+  // row t is token t % NT of its sequence, at position valid_end - NT + t % NT
+  const float v = decode_merge<NSPLIT>(X + ((size_t)t * (K_DIM / HD) + h) * NSPLIT * (HD + 2),
+                                       decode_active_splits(params[0] - NT + 1 + t % NT, NSPLIT, MINKEYS), HD, lane, b * 32 % HD + lane);
 #else
   const float v = X[(size_t)t * K_DIM + b * 32 + lane];
 #endif
@@ -80,6 +81,9 @@ template <int QT> struct QF;
 template <> struct QF<12> { static constexpr int BLOCK = 256, BBYTES = 144, BPS = 4; };
 // Q6_K: 256 weights in 210 bytes: 128 bytes low nibbles, 64 bytes high 2 bits, 16 int8 scales, d (fp16)
 template <> struct QF<14> { static constexpr int BLOCK = 256, BBYTES = 210, BPS = 4; };
+// Q5_K: Q4_K plus a fifth bit per weight: d, dmin, 12 bytes of scales/mins, 32 bytes qh (bit j of qh[l] is weight l of sub-block j),
+// 128 bytes of nibbles
+template <> struct QF<13> { static constexpr int BLOCK = 256, BBYTES = 176, BPS = 4; };
 // Q8_0: 32 weights in 34 bytes: d (fp16), 32 int8
 template <> struct QF<8> { static constexpr int BLOCK = 32, BBYTES = 34, BPS = 16; };
 template <int QT> struct QRow {
@@ -93,7 +97,10 @@ template <int QT> struct QRow {
 
 #ifdef GEMV
 #define NWARPS 4
-#define ROWS (NWARPS / KSPLIT)  // output rows per block; KSPLIT warps split each row's K
+#ifndef GEMV_R
+#define GEMV_R 1  // rows per warp (more than one with several tokens: the activations are loaded once for all of them)
+#endif
+#define ROWS (NWARPS / KSPLIT * GEMV_R)  // output rows per block; KSPLIT warps split each row's K
 
 __device__ __forceinline__ uint4 ld16(const unsigned char *a) {
   // 16 bytes at a 2-byte aligned address: three aligned 64-bit loads, shifted into place. The third load may read up to 8 bytes
@@ -111,11 +118,27 @@ __device__ __forceinline__ int dp16(uint4 q, int4 x, int acc) {  // 16 int8 x 16
 __device__ __forceinline__ uint4 and4(uint4 a, unsigned m) { return make_uint4(a.x & m, a.y & m, a.z & m, a.w & m); }
 __device__ __forceinline__ uint4 shr4(uint4 a, int s) { return make_uint4(a.x >> s, a.y >> s, a.z >> s, a.w >> s); }
 
-// one warp step st of a row wr: this lane's 32 weights times every token's activations, added to acc
-template <int QT> __device__ __forceinline__ void gemv_step(const unsigned char *wr, const int *XQ, int st, int lane, float (&acc)[NTOK]);
+// one warp step st: this lane's 32 weights of a row times every token's activations. The activations a lane needs depend only on
+// (st, lane), so they're loaded once (XA, gemv_x) and used for the GEMV_R rows a warp handles (gemv_w): with several tokens the
+// per-token activation loads from L1 otherwise outweigh the weights' DRAM traffic.
+template <int QT> struct XA;
+template <int QT> __device__ __forceinline__ void gemv_x(const int *XQ, int st, int lane, XA<QT> (&x)[NTOK]);
+template <int QT> __device__ __forceinline__ void gemv_w(const unsigned char *wr, int st, int lane, const XA<QT> (&x)[NTOK], float (&acc)[NTOK]);
 
-template <> __device__ __forceinline__ void gemv_step<12>(const unsigned char *wr, const int *XQ, int st, int lane, float (&acc)[NTOK]) {
-  // lane: 64-weight chunk j of its superblock (32 bytes: low nibbles = sub-block 2j, high = 2j+1), half p of it
+// Q4_K. lane: 64-weight chunk j of its superblock (32 bytes: low nibbles = sub-block 2j, high = 2j+1), half p of it
+template <> struct XA<12> { int4 lo, hi; float4 ds; };  // the chunk's activations, (d, d*sum) of sub-blocks 2j and 2j+1
+template <> __device__ __forceinline__ void gemv_x<12>(const int *XQ, int st, int lane, XA<12> (&x)[NTOK]) {
+  const int ub = st * QF<12>::BPS + (lane >> 3), j = (lane >> 1) & 3, p = lane & 1;
+  if (ub >= QRow<12>::NBLOCKS) return;
+  const int e = ub * 256 + 64 * j + 16 * p;  // first element of the low nibbles; the high ones are 32 later
+#pragma unroll
+  for (int t = 0; t < NTOK; t++) {
+    const int *xt = XQ + (size_t)t * XWORDS;
+    x[t].lo = *(const int4 *)(xt + e / 4), x[t].hi = *(const int4 *)(xt + e / 4 + 8);
+    x[t].ds = *(const float4 *)(xt + K_DIM / 4 + 2 * (e / 32));
+  }
+}
+template <> __device__ __forceinline__ void gemv_w<12>(const unsigned char *wr, int st, int lane, const XA<12> (&x)[NTOK], float (&acc)[NTOK]) {
   const int ub = st * QF<12>::BPS + (lane >> 3), j = (lane >> 1) & 3, p = lane & 1;
   if (ub >= QRow<12>::NBLOCKS) return;
   const unsigned char *sb = wr + (size_t)ub * QF<12>::BBYTES;
@@ -132,21 +155,65 @@ template <> __device__ __forceinline__ void gemv_step<12>(const unsigned char *w
     scl[h] = d * (float)s, mn[h] = dmin * (float)m;
   }
   const uint4 lo = and4(qs, 0x0F0F0F0F), hi = and4(shr4(qs, 4), 0x0F0F0F0F);
-  const int e = ub * 256 + 64 * j + 16 * p;  // first element of the low nibbles; the high ones are 32 later
 #pragma unroll
   for (int t = 0; t < NTOK; t++) {
-    const int *xt = XQ + (size_t)t * XWORDS;
-    const float4 ds = *(const float4 *)(xt + K_DIM / 4 + 2 * (e / 32));  // (d, d*sum) of sub-blocks 2j and 2j+1
-    float r = scl[0] * ds.x * (float)dp16(lo, *(const int4 *)(xt + e / 4), 0) +
-              scl[1] * ds.z * (float)dp16(hi, *(const int4 *)(xt + e / 4 + 8), 0);
-    if (p == 0) r -= mn[0] * ds.y + mn[1] * ds.w;  // the mins: once per sub-block
+    float r = scl[0] * x[t].ds.x * (float)dp16(lo, x[t].lo, 0) + scl[1] * x[t].ds.z * (float)dp16(hi, x[t].hi, 0);
+    if (p == 0) r -= mn[0] * x[t].ds.y + mn[1] * x[t].ds.w;  // the mins: once per sub-block
     acc[t] += r;
   }
 }
 
-template <> __device__ __forceinline__ void gemv_step<14>(const unsigned char *wr, const int *XQ, int st, int lane, float (&acc)[NTOK]) {
-  // lane: half h (128 weights) of its superblock, 16 of that half's 64 low-nibble bytes at b: low nibbles are weights b..,
-  // high ones 64+b..; their 2 high bits are in qh bytes b % 32.. at shift 2 * (b / 32), and 4 more for the high nibbles
+// Q5_K: Q4_K's lane layout (the activations are the same), the nibbles at 48, the fifth bits at 16
+template <> struct XA<13> : XA<12> {};
+template <> __device__ __forceinline__ void gemv_x<13>(const int *XQ, int st, int lane, XA<13> (&x)[NTOK]) {
+  gemv_x<12>(XQ, st, lane, reinterpret_cast<XA<12> (&)[NTOK]>(x));
+}
+template <> __device__ __forceinline__ void gemv_w<13>(const unsigned char *wr, int st, int lane, const XA<13> (&x)[NTOK], float (&acc)[NTOK]) {
+  const int ub = st * QF<13>::BPS + (lane >> 3), j = (lane >> 1) & 3, p = lane & 1;
+  if (ub >= QRow<13>::NBLOCKS) return;
+  const unsigned char *sb = wr + (size_t)ub * QF<13>::BBYTES;
+  const uint4 hd = *(const uint4 *)sb, qh = *(const uint4 *)(sb + 16 + 16 * p), qs = *(const uint4 *)(sb + 48 + 32 * j + 16 * p);
+  const float d = __half2float(__ushort_as_half((unsigned short)(hd.x & 0xffff))),
+              dmin = __half2float(__ushort_as_half((unsigned short)(hd.x >> 16)));
+  float scl[2], mn[2];
+#pragma unroll
+  for (int h = 0; h < 2; h++) {
+    const int sbk = 2 * j + h, sh = 8 * (sbk & 3);
+    const unsigned b0 = (hd.y >> sh) & 0xff, b1 = (hd.z >> sh) & 0xff, b2 = (hd.w >> sh) & 0xff;
+    const unsigned s = sbk < 4 ? b0 & 63 : (b2 & 0xF) | ((b0 >> 6) << 4), m = sbk < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);
+    scl[h] = d * (float)s, mn[h] = dmin * (float)m;
+  }
+  // 5-bit values: nibble | (fifth bit << 4), the bit of sub-block 2j for the low nibbles, 2j+1 for the high ones
+  const uint4 lo = make_uint4((qs.x & 0x0F0F0F0F) | (((qh.x >> (2 * j)) & 0x01010101) << 4), (qs.y & 0x0F0F0F0F) | (((qh.y >> (2 * j)) & 0x01010101) << 4),
+                              (qs.z & 0x0F0F0F0F) | (((qh.z >> (2 * j)) & 0x01010101) << 4), (qs.w & 0x0F0F0F0F) | (((qh.w >> (2 * j)) & 0x01010101) << 4));
+  const uint4 hi = make_uint4(((qs.x >> 4) & 0x0F0F0F0F) | (((qh.x >> (2 * j + 1)) & 0x01010101) << 4),
+                              ((qs.y >> 4) & 0x0F0F0F0F) | (((qh.y >> (2 * j + 1)) & 0x01010101) << 4),
+                              ((qs.z >> 4) & 0x0F0F0F0F) | (((qh.z >> (2 * j + 1)) & 0x01010101) << 4),
+                              ((qs.w >> 4) & 0x0F0F0F0F) | (((qh.w >> (2 * j + 1)) & 0x01010101) << 4));
+#pragma unroll
+  for (int t = 0; t < NTOK; t++) {
+    float r = scl[0] * x[t].ds.x * (float)dp16(lo, x[t].lo, 0) + scl[1] * x[t].ds.z * (float)dp16(hi, x[t].hi, 0);
+    if (p == 0) r -= mn[0] * x[t].ds.y + mn[1] * x[t].ds.w;
+    acc[t] += r;
+  }
+}
+
+// Q6_K. lane: half h (128 weights) of its superblock, 16 of that half's 64 low-nibble bytes at b: low nibbles are weights b..,
+// high ones 64+b..; their 2 high bits are in qh bytes b % 32.. at shift 2 * (b / 32), and 4 more for the high nibbles
+template <> struct XA<14> { int4 lo, hi; float dl, dh; };
+template <> __device__ __forceinline__ void gemv_x<14>(const int *XQ, int st, int lane, XA<14> (&x)[NTOK]) {
+  const int ub = st * QF<14>::BPS + (lane >> 3), h = (lane >> 2) & 1, b = (lane & 3) * 16;
+  if (ub >= QRow<14>::NBLOCKS) return;
+  const int e = ub * 256 + 128 * h + b;
+#pragma unroll
+  for (int t = 0; t < NTOK; t++) {
+    const int *xt = XQ + (size_t)t * XWORDS;
+    const float2 *ds = (const float2 *)(xt + K_DIM / 4);
+    x[t].lo = *(const int4 *)(xt + e / 4), x[t].hi = *(const int4 *)(xt + e / 4 + 16);
+    x[t].dl = ds[e / 32].x, x[t].dh = ds[e / 32 + 2].x;
+  }
+}
+template <> __device__ __forceinline__ void gemv_w<14>(const unsigned char *wr, int st, int lane, const XA<14> (&x)[NTOK], float (&acc)[NTOK]) {
   const int ub = st * QF<14>::BPS + (lane >> 3), h = (lane >> 2) & 1, b = (lane & 3) * 16;
   if (ub >= QRow<14>::NBLOCKS) return;
   const unsigned char *sb = wr + (size_t)ub * QF<14>::BBYTES;
@@ -161,70 +228,100 @@ template <> __device__ __forceinline__ void gemv_step<14>(const unsigned char *w
   q_lo.z = __vsubss4(vl.z | (hl.z << 4), 0x20202020), q_lo.w = __vsubss4(vl.w | (hl.w << 4), 0x20202020);
   q_hi.x = __vsubss4(vh.x | (hh.x << 4), 0x20202020), q_hi.y = __vsubss4(vh.y | (hh.y << 4), 0x20202020);
   q_hi.z = __vsubss4(vh.z | (hh.z << 4), 0x20202020), q_hi.w = __vsubss4(vh.w | (hh.w << 4), 0x20202020);
-  const int e = ub * 256 + 128 * h + b;
+#pragma unroll
+  for (int t = 0; t < NTOK; t++)
+    acc[t] += sc_lo * x[t].dl * (float)dp16(q_lo, x[t].lo, 0) + sc_hi * x[t].dh * (float)dp16(q_hi, x[t].hi, 0);
+}
+
+// Q8_0. lane: half p (16 int8) of block ub
+template <> struct XA<8> { int4 q; float d; };
+template <> __device__ __forceinline__ void gemv_x<8>(const int *XQ, int st, int lane, XA<8> (&x)[NTOK]) {
+  const int ub = st * QF<8>::BPS + (lane >> 1), p = lane & 1;
+  if (ub >= QRow<8>::NBLOCKS) return;
+  const int e = ub * 32 + 16 * p;
 #pragma unroll
   for (int t = 0; t < NTOK; t++) {
     const int *xt = XQ + (size_t)t * XWORDS;
-    const float2 *ds = (const float2 *)(xt + K_DIM / 4);
-    acc[t] += sc_lo * ds[e / 32].x * (float)dp16(q_lo, *(const int4 *)(xt + e / 4), 0) +
-              sc_hi * ds[e / 32 + 2].x * (float)dp16(q_hi, *(const int4 *)(xt + e / 4 + 16), 0);
+    x[t].q = *(const int4 *)(xt + e / 4), x[t].d = ((const float2 *)(xt + K_DIM / 4))[ub].x;
   }
 }
-
-template <> __device__ __forceinline__ void gemv_step<8>(const unsigned char *wr, const int *XQ, int st, int lane, float (&acc)[NTOK]) {
-  // lane: half p (16 int8) of block ub
+template <> __device__ __forceinline__ void gemv_w<8>(const unsigned char *wr, int st, int lane, const XA<8> (&x)[NTOK], float (&acc)[NTOK]) {
   const int ub = st * QF<8>::BPS + (lane >> 1), p = lane & 1;
   if (ub >= QRow<8>::NBLOCKS) return;
   const unsigned char *qb = wr + (size_t)ub * QF<8>::BBYTES;
   const uint4 q = ld16(qb + 2 + 16 * p);
   const float d = ld_half(qb);
-  const int e = ub * 32 + 16 * p;
 #pragma unroll
-  for (int t = 0; t < NTOK; t++) {
-    const int *xt = XQ + (size_t)t * XWORDS;
-    acc[t] += d * ((const float2 *)(xt + K_DIM / 4))[ub].x * (float)dp16(q, *(const int4 *)(xt + e / 4), 0);
-  }
+  for (int t = 0; t < NTOK; t++) acc[t] += d * x[t].d * (float)dp16(q, x[t].q, 0);
 }
 
 // row block blk of weight W ([N][QRow<QT>::BYTES]): output columns blk * ROWS.. of OUT ([NTOK][N_OUT], already offset to W's
-// first column)
+// first column). Warp w handles rows (w / KSPLIT) * GEMV_R .. + GEMV_R, its K share ks.
 template <int QT, int N>
-__device__ __forceinline__ void gemv_rows(float *OUT, const unsigned char *W, const int *XQ, int blk, float (*part)[NTOK]) {
+__device__ __forceinline__ void gemv_rows(float *OUT, const unsigned char *W, const int *XQ, int blk, float (*part)[GEMV_R][NTOK],
+                                          const float *RES = nullptr) {
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int row = blk * ROWS + warp / KSPLIT, ks = warp % KSPLIT;
-  float acc[NTOK];
+  const int row0 = blk * ROWS + (warp / KSPLIT) * GEMV_R, ks = warp % KSPLIT;
+  float acc[GEMV_R][NTOK];
 #pragma unroll
-  for (int t = 0; t < NTOK; t++) acc[t] = 0.0f;
-  if (row < N) {
-    const unsigned char *wr = W + (size_t)row * QRow<QT>::BYTES;
-#pragma unroll 4
-    for (int st = ks; st < QRow<QT>::STEPS; st += KSPLIT) gemv_step<QT>(wr, XQ, st, lane, acc);
+  for (int r = 0; r < GEMV_R; r++)
+#pragma unroll
+    for (int t = 0; t < NTOK; t++) acc[r][t] = 0.0f;
+  if (row0 < N) {
+#pragma unroll (GEMV_R > 1 ? 2 : 4)
+    for (int st = ks; st < QRow<QT>::STEPS; st += KSPLIT) {
+      XA<QT> x[NTOK];
+      gemv_x<QT>(XQ, st, lane, x);
+#pragma unroll
+      for (int r = 0; r < GEMV_R; r++)
+        if (GEMV_R == 1 || row0 + r < N) gemv_w<QT>(W + (size_t)(row0 + r) * QRow<QT>::BYTES, st, lane, x, acc[r]);
+    }
   }
 #pragma unroll
-  for (int t = 0; t < NTOK; t++)
+  for (int r = 0; r < GEMV_R; r++)
 #pragma unroll
-    for (int off = 16; off; off >>= 1) acc[t] += __shfl_xor_sync(0xffffffff, acc[t], off);
+    for (int t = 0; t < NTOK; t++)
+#pragma unroll
+      for (int off = 16; off; off >>= 1) acc[r][t] += __shfl_xor_sync(0xffffffff, acc[r][t], off);
 #if KSPLIT > 1
   if (lane == 0)
 #pragma unroll
-    for (int t = 0; t < NTOK; t++) part[warp][t] = acc[t];
+    for (int r = 0; r < GEMV_R; r++)
+#pragma unroll
+      for (int t = 0; t < NTOK; t++) part[warp][r][t] = acc[r][t];
   __syncthreads();
   if (ks == 0 && lane == 0)
 #pragma unroll
-    for (int t = 0; t < NTOK; t++) {
+    for (int r = 0; r < GEMV_R; r++)
 #pragma unroll
-      for (int s = 1; s < KSPLIT; s++) acc[t] += part[warp + s][t];
-    }
+      for (int t = 0; t < NTOK; t++) {
+#pragma unroll
+        for (int s = 1; s < KSPLIT; s++) acc[r][t] += part[warp + s][r][t];
+      }
 #endif
-  if (ks == 0 && lane == 0 && row < N)
+  if (ks == 0 && lane == 0)
 #pragma unroll
-    for (int t = 0; t < NTOK; t++) OUT[(size_t)t * N_OUT + row] = acc[t];
+    for (int r = 0; r < GEMV_R; r++)
+      if (row0 + r < N)
+#pragma unroll
+        for (int t = 0; t < NTOK; t++) {
+#ifdef RESID  // the residual stream added as it's stored (one weight: OUT and RES are [NTOK][N])
+          OUT[(size_t)t * N_OUT + row0 + r] = acc[r][t] + RES[(size_t)t * N_OUT + row0 + r];
+#else
+          OUT[(size_t)t * N_OUT + row0 + r] = acc[r][t];
+#endif
+        }
 }
 
 // grid (total row blocks over the segments), NWARPS * 32 threads. OUT: [NTOK][N_OUT] fp32. XQ: [NTOK][XWORDS] from QUANTIZE.
 // SEG_DISPATCH calls gemv_rows for the segment that owns blockIdx.x (uniform per block, so the __syncthreads in it is safe).
-extern "C" __global__ void __launch_bounds__(NWARPS * 32) KNAME(float *__restrict__ OUT, SEG_PARAMS, const int *__restrict__ XQ) {
-  __shared__ float part[NWARPS][NTOK];
+#ifdef RESID
+#define RES_PARAM , const float *__restrict__ RES
+#else
+#define RES_PARAM
+#endif
+extern "C" __global__ void __launch_bounds__(NWARPS * 32) KNAME(float *__restrict__ OUT, SEG_PARAMS, const int *__restrict__ XQ RES_PARAM) {
+  __shared__ float part[NWARPS][GEMV_R][NTOK];
   const int blk = blockIdx.x;
   SEG_DISPATCH
 }
@@ -250,6 +347,17 @@ template <> __device__ __forceinline__ void dequant8<12>(const unsigned char *wr
   const int m = sbk < 4 ? sc[sbk + 4] & 63 : (sc[sbk + 4] >> 4) | ((sc[sbk] >> 6) << 4);
 #pragma unroll
   for (int i = 0; i < 8; i++) v[i] = d * s * (float)((b[16 + 32 * j + l0 + i] >> (4 * hi)) & 0xF) - dmin * m;
+}
+template <> __device__ __forceinline__ void dequant8<13>(const unsigned char *wr, int col, float (&v)[8]) {
+  const unsigned char *b = wr + (size_t)(col / 256) * 176;
+  const int e0 = col % 256, j = e0 / 64, hi = (e0 % 64) >= 32, l0 = e0 % 32, sbk = 2 * j + hi;
+  const float d = __half2float(*(const half *)b), dmin = __half2float(*(const half *)(b + 2));
+  const unsigned char *sc = b + 4;
+  const int s = sbk < 4 ? sc[sbk] & 63 : (sc[sbk + 4] & 0xF) | ((sc[sbk - 4] >> 6) << 4);
+  const int m = sbk < 4 ? sc[sbk + 4] & 63 : (sc[sbk + 4] >> 4) | ((sc[sbk] >> 6) << 4);
+#pragma unroll
+  for (int i = 0; i < 8; i++)
+    v[i] = d * s * (float)(((b[48 + 32 * j + l0 + i] >> (4 * hi)) & 0xF) | (((b[16 + l0 + i] >> sbk) & 1) << 4)) - dmin * m;
 }
 template <> __device__ __forceinline__ void dequant8<14>(const unsigned char *wr, int col, float (&v)[8]) {
   const unsigned char *b = wr + (size_t)(col / 256) * 210;
@@ -303,6 +411,23 @@ template <> __device__ __forceinline__ void requant32<12>(const unsigned char *w
     const unsigned w[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
     for (int k = 0; k < 4; k++) q[4 * i + k] = (w[k] >> (4 * (j & 1))) & 0x0F0F0F0F;
+  }
+  sc = make_float2(d * s, dmin * m);
+}
+template <> __device__ __forceinline__ void requant32<13>(const unsigned char *wr, int blk, unsigned (&q)[8], float2 &sc) {
+  const unsigned char *b = wr + (size_t)(blk / 8) * 176;
+  const int j = blk % 8;  // sub-block: nibbles (j & 1) of qs[32 (j/2) ..], fifth bits = bit j of qh[0..31]
+  const float d = __half2float(*(const half *)b), dmin = __half2float(*(const half *)(b + 2));
+  const unsigned char *scs = b + 4;
+  const int s = j < 4 ? scs[j] & 63 : (scs[j + 4] & 0xF) | ((scs[j - 4] >> 6) << 4);
+  const int m = j < 4 ? scs[j + 4] & 63 : (scs[j + 4] >> 4) | ((scs[j] >> 6) << 4);
+  const uint4 *qs = (const uint4 *)(b + 48 + 32 * (j / 2)), *qh = (const uint4 *)(b + 16);
+#pragma unroll
+  for (int i = 0; i < 2; i++) {
+    const uint4 u = qs[i], h = qh[i];
+    const unsigned w[4] = {u.x, u.y, u.z, u.w}, hb[4] = {h.x, h.y, h.z, h.w};
+#pragma unroll
+    for (int k = 0; k < 4; k++) q[4 * i + k] = ((w[k] >> (4 * (j & 1))) & 0x0F0F0F0F) | (((hb[k] >> j) & 0x01010101) << 4);
   }
   sc = make_float2(d * s, dmin * m);
 }

@@ -7,7 +7,7 @@ from tinygrad.helpers import prod, getenv, unwrap
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
 from tinygrad.llm.kernels.nv import nv_linear, nv_quant_gemv, nv_dequant, nv_gemm_supported, nv_note_rmsnorm, NV_QUANT_UNIT, NV_QUANT_MAX_TOKENS
-from tinygrad.llm.kernels.nv import nv_mmq, QuantSeg, Glu
+from tinygrad.llm.kernels.nv import nv_mmq, nv_residual_add, QuantSeg, Glu
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -144,6 +144,10 @@ class Linear(nn.Linear):
       out = (x.unsqueeze(-2) @ self.weight.reshape(self.groups, -1, self.in_features).transpose(-1, -2)).squeeze(-2)
       return out if self.bias is None else out + self.bias.reshape(self.groups, -1)
     return super().__call__(x)
+
+def residual_add(x:Tensor, y:Tensor) -> Tensor:
+  """x + y. On NV/CUDA, when y is a GGUF quant GEMV's output (decode), the GEMV adds x as it stores (no separate add kernel)."""
+  return out if (out:=nv_residual_add(x, y)) is not None else x + y
 
 class RMSNorm(nn.RMSNorm):
   """nn.RMSNorm. On NV/CUDA, a GGUF quant GEMV of its output (decode) applies the norm itself while quantizing the activations, so

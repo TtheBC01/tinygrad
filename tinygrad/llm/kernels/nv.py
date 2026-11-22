@@ -203,6 +203,53 @@ def _gemm(a:Tensor, b:Tensor, ta:bool=False, tb:bool=False, cfg:Cfg|None=None, o
   return Tensor.custom_kernel(out, a, b, ws, flags, fxn=functools.partial(_program, cfg=cfg, sp=sp, ta=ta, tb=tb, glu=glu),
                               grad_fxn=functools.partial(_grad, ta=ta, tb=tb) if glu is None else None)[0]
 
+# ******** implicit-GEMM convolution (nv_gemm.cu with CONV) ********
+
+@dataclass(frozen=True)
+class ConvShape:
+  nb:int; cin:int; h:int; w:int; cout:int; kh:int; kw:int; stride:int; pad:int  # noqa: E702
+  @property
+  def oh(self) -> int: return (self.h + 2 * self.pad - self.kh) // self.stride + 1
+  @property
+  def ow(self) -> int: return (self.w + 2 * self.pad - self.kw) // self.stride + 1
+  @property
+  def m(self) -> int: return self.nb * self.oh * self.ow
+
+def _conv_program(Y:UOp, X:UOp, Wt:UOp, WS:UOp, FLAGS:UOp, cfg:Cfg, cs:ConvShape) -> UOp:
+  Mp, K = -(-cs.m // cfg.BM) * cfg.BM, cs.kh * cs.kw * cs.cin
+  name = f"ampere_conv_{cs.nb}x{cs.cin}x{cs.h}x{cs.w}_{cs.cout}x{cs.kh}x{cs.kw}_s{cs.stride}p{cs.pad}_{cfg}"
+  defines = dict(KNAME=name, M_DIM=Mp, N_DIM=cs.cout, K_DIM=K, BM=cfg.BM, BN=cfg.BN, BK=cfg.BK, WM=cfg.WM, WN=cfg.WN, STAGES=cfg.STAGES,
+                 GROUP_M=cfg.GROUP_M, SK_P=0, TRANS_A=0, TRANS_B=1, OUT_F32=0, BF16=0, CONV=1, CONV_M=cs.m, CONV_H=cs.h, CONV_W=cs.w,
+                 CONV_CIN=cs.cin, CONV_KW=cs.kw, CONV_OH=cs.oh, CONV_OW=cs.ow, CONV_S=cs.stride, CONV_P=cs.pad)
+  src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + SRC
+  threads, blocks = UOp.special(cfg.threads, "lidx0"), UOp.special((Mp // cfg.BM) * (cs.cout // cfg.BN), "gidx0")
+  io = 2 * (cs.nb * cs.cin * cs.h * cs.w + cs.cout * K + cs.m * cs.cout)
+  est = Estimates(ops=2 * cs.m * cs.cout * K, lds=io, mem=io)
+  sink = UOp.sink(Y.base, X.base, Wt.base, WS.base, FLAGS.base, threads, blocks, arg=KernelInfo(name, estimates=est, dyn_shared_mem=cfg.smem))
+  return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src)))
+
+CONV_BIG, CONV_N64 = Cfg(SK=False), Cfg(BM=128, BN=64, WN=32, STAGES=4, SK=False)
+
+def nv_conv2d(x:Tensor, w:Tensor, stride:int=1, padding:int=0) -> Tensor|None:
+  """conv2d of fp16 NCHW x with w (Cout, Cin, KH, KW) as an implicit GEMM on the tensor cores (fp32 accumulate, fp16 out), or None
+  if unsupported (groups/dilation, Cin not a multiple of 32, Cout not of 64). The input and weights are transposed to channels-last
+  first (each im2col chunk is 8 channels of one pixel); the output is written NCHW."""
+  if not nv_gemm_supported(x.device) or x.dtype != dtypes.half or w.dtype != dtypes.half or x.ndim != 4 or w.ndim != 4: return None
+  if x.device != w.device or x.uop.axis is not None or w.uop.axis is not None or not all(isinstance(v, int) for v in (*x.shape, *w.shape)):
+    return None
+  (nb, cin, h, wd), (cout, cin2, kh, kw) = x.shape, w.shape
+  cs = ConvShape(int(nb), int(cin), int(h), int(wd), int(cout), int(kh), int(kw), stride, padding)
+  if cin2 != cin or cs.cin % 32 or cs.cout % 64 or cs.oh <= 0 or cs.ow <= 0: return None
+  if (o:=getenv("NV_CONV_CFG", "")):  # BM,BN,BK,WM,WN,STAGES (tuning)
+    cfg = Cfg(**{k: int(v) for k, v in zip(("BM", "BN", "BK", "WM", "WN", "STAGES"), o.split(","))}, SK=False)
+  else: cfg = CONV_BIG if cs.cout % 128 == 0 and cs.m >= 4 * 1024 else CONV_N64
+  if cs.cout % cfg.BN or cfg.smem > MAX_SMEM: return None
+  xh = x.permute(0, 2, 3, 1).contiguous()
+  wk = w.permute(0, 2, 3, 1).reshape(cs.cout, cs.kh * cs.kw * cs.cin).contiguous()
+  dummy = Tensor.empty(1, dtype=dtypes.float32, device=x.device), Tensor.empty(1, dtype=dtypes.int32, device=x.device)
+  out = Tensor.empty(cs.nb, cs.cout, cs.oh, cs.ow, dtype=dtypes.half, device=x.device)
+  return Tensor.custom_kernel(out, xh, wk, *dummy, fxn=functools.partial(_conv_program, cfg=cfg, cs=cs))[0]
+
 NV_LINEAR_MIN_ROWS = 16  # below this (decode), tinygrad's own GEMV is the right kernel
 
 def nv_linear(x:Tensor, weight:Tensor, dequant:Callable[[Tensor], Tensor|None]|None=None, glu:Glu|None=None,
@@ -274,6 +321,7 @@ def _int_tensor(x:int|UOp) -> Tensor|None:
 class DecodeCfg:
   """Flash decoding's launch shape: NSPLIT blocks per (batch, KV head) of NWARPS warps, each warp issuing UNR steps of loads at once."""
   nb:int
+  nt:int  # query tokens per sequence
   nh:int
   nkv:int
   nctx:int
@@ -284,35 +332,39 @@ class DecodeCfg:
   @property
   def minkeys(self) -> int: return self.nwarps * (32 // (self.hd // 8)) * self.unr  # keys per block step: the fewest a split gets
   @property
-  def name(self) -> str: return f"{self.nb}_{self.nh}_{self.nkv}_{self.nctx}_{self.hd}_s{self.nsplit}w{self.nwarps}u{self.unr}"
+  def name(self) -> str:
+    return f"{self.nb}{f'x{self.nt}' if self.nt > 1 else ''}_{self.nh}_{self.nkv}_{self.nctx}_{self.hd}_s{self.nsplit}w{self.nwarps}u{self.unr}"
 
 def _decode_program(OUT:UOp, *srcs:UOp, stage:str, cfg:DecodeCfg) -> UOp:
   name = f"nv_flash_decode_{stage.lower()}_{cfg.name}"
-  defines = {stage: 1, "KNAME": name, "NB": cfg.nb, "NH": cfg.nh, "NKV": cfg.nkv, "NCTX": cfg.nctx, "HD": cfg.hd, "NSPLIT": cfg.nsplit,
+  defines = {stage: 1, "KNAME": name, "NB": cfg.nb, "NT": cfg.nt, "NH": cfg.nh, "NKV": cfg.nkv, "NCTX": cfg.nctx, "HD": cfg.hd, "NSPLIT": cfg.nsplit,
              "NWARPS": cfg.nwarps, "UNR": cfg.unr, "MINKEYS": cfg.minkeys}
   src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + DECODE_SRC
-  dims:tuple[UOp, ...] = (UOp.special(32 * cfg.nwarps, "lidx0"), UOp.special(cfg.nsplit, "gidx0"), UOp.special(cfg.nb * cfg.nkv, "gidx1")) \
-    if stage == "PARTIAL" else (UOp.special(cfg.hd, "lidx0"), UOp.special(cfg.nb * cfg.nh, "gidx0"))
+  dims:tuple[UOp, ...] = (UOp.special(32 * cfg.nwarps, "lidx0"), UOp.special(cfg.nsplit, "gidx0"), UOp.special(cfg.nb * cfg.nt * cfg.nkv, "gidx1")) \
+    if stage == "PARTIAL" else (UOp.special(cfg.hd, "lidx0"), UOp.special(cfg.nb * cfg.nt * cfg.nh, "gidx0"))
   # the KV bytes read depend on the runtime length: count the query side only
-  n = cfg.nb * cfg.nh * cfg.hd
+  n = cfg.nb * cfg.nt * cfg.nh * cfg.hd
   est = Estimates(ops=4 * n, lds=4 * n, mem=4 * n)
   sink = UOp.sink(OUT.base, *[x.base for x in srcs], *dims, arg=KernelInfo(name, estimates=est))
   return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src)))
 
+NV_DECODE_MAX_TOKENS = 8  # flash decoding for up to this many query tokens (speculative decoding's check); more go to the flash kernel
+
 def nv_flash_decode(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp, nsms:int) -> Tensor|None:
-  """One query token per sequence: q (B, H, 1, D) over the fp16 cache's keys [0, valid_end). (B, 1, H * D) fp32, or None."""
-  B, H, _, D = (int(x) for x in q.shape)
+  """A few query tokens per sequence: q (B, H, T, D), token t at position valid_end - T + t, over the fp16 cache's keys up to it.
+  (B, T, H * D) fp32, or None."""
+  B, H, T, D = (int(x) for x in q.shape)
   KVH, NCTX = int(assigned_kv.shape[2]), int(assigned_kv.shape[3])
   if (end_t:=_int_tensor(valid_end)) is None: return None
   # enough blocks to fill the GPU a few times over: each streams its share of the keys
-  cfg = DecodeCfg(B, H, KVH, NCTX, D, nsplit=max(1, min(64, -(-getenv("NV_DECODE_BPS", 4) * nsms // (B * KVH)))),
+  cfg = DecodeCfg(B, T, H, KVH, NCTX, D, nsplit=max(1, min(64, -(-getenv("NV_DECODE_BPS", 4) * nsms // (B * T * KVH)))),
                   nwarps=getenv("NV_DECODE_WARPS", 4), unr=getenv("NV_DECODE_UNR", 2))
   params = end_t.contiguous()
-  part = Tensor.empty(B * H * cfg.nsplit * (D + 2), dtype=dtypes.float32, device=q.device)
-  part = Tensor.custom_kernel(part, q.cast(dtypes.half).contiguous(), assigned_kv, params,
+  part = Tensor.empty(B * T * H * cfg.nsplit * (D + 2), dtype=dtypes.float32, device=q.device)
+  part = Tensor.custom_kernel(part, q.transpose(1, 2).cast(dtypes.half).contiguous(), assigned_kv, params,
                               fxn=functools.partial(_decode_program, stage="PARTIAL", cfg=cfg))[0]
-  out = Tensor.invalids(B, 1, H, D, dtype=dtypes.float32, device=q.device)
-  out = Tensor.custom_kernel(out, part, params, fxn=functools.partial(_decode_program, stage="COMBINE", cfg=cfg))[0].reshape(B, 1, H * D)
+  out = Tensor.invalids(B, T, H, D, dtype=dtypes.float32, device=q.device)
+  out = Tensor.custom_kernel(out, part, params, fxn=functools.partial(_decode_program, stage="COMBINE", cfg=cfg))[0].reshape(B, T, H * D)
   _note_decode(out, part, params, cfg)
   return out
 
@@ -328,7 +380,7 @@ def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tenso
   if not all(isinstance(v, int) for v in (B, H, D, Bk, KVH, NCTX, Dk)): return None
   B, H, D, KVH, NCTX = int(B), int(H), int(D), int(KVH), int(NCTX)
   if B != Bk or D != Dk or H % KVH or D not in (64, 128): return None
-  if isinstance(T, int) and T == 1: return nv_flash_decode(q, assigned_kv, valid_end, num_sms(q.device))
+  if isinstance(T, int) and T <= NV_DECODE_MAX_TOKENS: return nv_flash_decode(q, assigned_kv, valid_end, num_sms(q.device))
   T_max = q.max_shape[2]
   if not isinstance(T_max, int) or T_max < 16: return None  # a few tokens (e.g. speculative decode) stay on tinygrad's kernels
   cfg = FlashCfg(WARPS=4 if T_max >= 64 else 2)
@@ -345,12 +397,12 @@ def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tenso
 
 # ******** GEMV on GGUF quantized weights (decode) ********
 
-Q8_0, Q4_K, Q6_K = 8, 12, 14  # ggml types
+Q8_0, Q4_K, Q5_K, Q6_K = 8, 12, 13, 14  # ggml types
 # K must be a multiple of this: the quant block, and for Q6_K/Q8_0 enough of them for 8-byte aligned rows (the kernel's ld16)
-NV_QUANT_UNIT = {Q8_0: 256, Q4_K: 256, Q6_K: 1024}
-NV_QUANT_BYTES = {Q8_0: 34 / 32, Q4_K: 144 / 256, Q6_K: 210 / 256}  # bytes per weight
-NV_QUANT_STEP = {Q8_0: 512, Q4_K: 1024, Q6_K: 1024}  # weights per warp per loop iteration
-NV_QUANT_ALIGN = {Q8_0: 8, Q4_K: 16, Q6_K: 8}  # byte alignment of the weights the kernel's loads need (Q4_K: 128-bit loads)
+NV_QUANT_UNIT = {Q8_0: 256, Q4_K: 256, Q5_K: 256, Q6_K: 1024}
+NV_QUANT_BYTES = {Q8_0: 34 / 32, Q4_K: 144 / 256, Q5_K: 176 / 256, Q6_K: 210 / 256}  # bytes per weight
+NV_QUANT_STEP = {Q8_0: 512, Q4_K: 1024, Q5_K: 1024, Q6_K: 1024}  # weights per warp per loop iteration
+NV_QUANT_ALIGN = {Q8_0: 8, Q4_K: 16, Q5_K: 16, Q6_K: 8}  # byte alignment of the weights the kernel's loads need (Q4_K: 128-bit loads)
 NV_QUANT_MAX_TOKENS = 8  # each warp keeps one accumulator per token; prefill dequantizes to fp16 for the GEMM instead
 
 QuantSeg = tuple[Tensor, int, int]  # one weight of a GEMV or dequant launch: (packed blocks, ggml type, rows)
@@ -364,7 +416,8 @@ def _seg_ok(seg:QuantSeg, k:int, device:str|tuple[str, ...]|None) -> bool:
   return qtype in NV_QUANT_UNIT and k % NV_QUANT_UNIT[qtype] == 0 and packed.device == device and packed.uop.axis is None and \
     packed.nbytes() == int(n * k * NV_QUANT_BYTES[qtype])
 
-def _seg_source(segs:tuple[tuple[int, int], ...], stage:str, ksplit:int, interleave:bool=False) -> dict[str, str]:
+def _seg_source(segs:tuple[tuple[int, int], ...], stage:str, ksplit:int, interleave:bool=False, rows_per_warp:int=1,
+                resid:bool=False) -> dict[str, str]:
   # SEG_PARAMS and SEG_DISPATCH for nv_quant.cu: the weight pointers, and which weight a GEMV block / DEQUANT thread works on.
   # interleave (DEQUANT, two weights of the same rows): output row 2r is row r of the first, 2r + 1 row r of the second
   params = ", ".join(f"const unsigned char *__restrict__ W{i}" for i in range(len(segs)))
@@ -376,8 +429,8 @@ def _seg_source(segs:tuple[tuple[int, int], ...], stage:str, ksplit:int, interle
   calls, start, col = [], 0, 0
   for i, (qtype, n) in enumerate(segs):
     if stage == "GEMV":
-      end = start + -(-n // (4 // ksplit))
-      calls.append(f"if (blk < {end}) gemv_rows<{qtype}, {n}>(OUT + {col}, W{i}, XQ, blk - {start}, part);")
+      end = start + -(-n // (4 // ksplit * rows_per_warp))
+      calls.append(f"if (blk < {end}) gemv_rows<{qtype}, {n}>(OUT + {col}, W{i}, XQ, blk - {start}, part{', RES' if resid else ''});")
     else:
       end = start + n
       call = f"{fn}<{qtype}>(W{i} + (size_t)(row - {start}) * QRow<{qtype}>::BYTES, {args});"
@@ -390,7 +443,8 @@ _CTYPE = {dtypes.float32: "float", dtypes.half: "half"}
 Norm = tuple[float, DType, DType, DType]
 
 def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, segs:tuple[tuple[int, int], ...]=(), ksplit:int=1,
-                   glu:Glu|None=None, norm:Norm|None=None, attn:DecodeCfg|None=None, interleave:bool=False, xtype:DType|None=None) -> UOp:
+                   glu:Glu|None=None, norm:Norm|None=None, attn:DecodeCfg|None=None, interleave:bool=False, xtype:DType|None=None,
+                   rows_per_warp:int=1, resid:bool=False) -> UOp:
   qts, ns, ntot = "x".join(str(q) for q, _ in segs), "x".join(str(n) for _, n in segs), sum(n for _, n in segs)
   wbytes = int(sum(n * k * NV_QUANT_BYTES[q] for q, n in segs))
   if stage in ("DEQUANT", "REQUANT"):
@@ -411,15 +465,16 @@ def _quant_program(OUT:UOp, *srcs:UOp, stage:str, k:int, ntok:int, segs:tuple[tu
       if wuse != wdt and wuse == dtypes.half: defines["WLOAD(w)"] = "__half2float(__float2half_rn((float)(w)))"
     if xtype is not None: name, defines = name + "_" + _CTYPE[xtype], {**defines, "XTYPE": _CTYPE[xtype]}
     if attn is not None:
-      name += f"_attn{attn.hd}s{attn.nsplit}m{attn.minkeys}"
-      defines.update({"ATTN": 1, "HD": attn.hd, "NSPLIT": attn.nsplit, "MINKEYS": attn.minkeys})
+      name += f"_attn{attn.hd}s{attn.nsplit}m{attn.minkeys}" + (f"t{attn.nt}" if attn.nt > 1 else "")
+      defines.update({"ATTN": 1, "HD": attn.hd, "NSPLIT": attn.nsplit, "MINKEYS": attn.minkeys, "NT": attn.nt})
     dims = (UOp.special(128, "lidx0"), UOp.special(ntok * k // 128, "gidx0"))
     io = ntok * k * (4 * (2 if glu else attn.nsplit if attn else 1) + 1) + (k * 4 if norm else 0)
     est = Estimates(ops=(10 if glu else 6 if norm else 3) * ntok * k, lds=io, mem=io)
   else:
-    name = f"nv_q{qts}_gemv_{ntok}_{ns}_{k}_ks{ksplit}"
-    defines = {"GEMV": 1, "N_OUT": ntot, "NTOK": ntok, "KSPLIT": ksplit, **_seg_source(segs, stage, ksplit)}
-    dims = (UOp.special(128, "lidx0"), UOp.special(sum(-(-n // (4 // ksplit)) for _, n in segs), "gidx0"))
+    name = f"nv_q{qts}_gemv_{ntok}_{ns}_{k}_ks{ksplit}" + (f"r{rows_per_warp}" if rows_per_warp > 1 else "") + ("_res" if resid else "")
+    defines = {"GEMV": 1, "N_OUT": ntot, "NTOK": ntok, "KSPLIT": ksplit, "GEMV_R": rows_per_warp,
+               **_seg_source(segs, stage, ksplit, rows_per_warp=rows_per_warp, resid=resid), **({"RESID": 1} if resid else {})}
+    dims = (UOp.special(128, "lidx0"), UOp.special(sum(-(-n // (4 // ksplit * rows_per_warp)) for _, n in segs), "gidx0"))
     io = wbytes + ntok * (k + 4 * ntot)
     est = Estimates(ops=2 * ntok * ntot * k, lds=io, mem=io)
   src = "".join(f"#define {kk} {v}\n" for kk, v in {**defines, "KNAME": name, "K_DIM": k}.items()) + QUANT_SRC
@@ -440,12 +495,28 @@ def nv_quant_gemv(x:Tensor, segs:Sequence[QuantSeg], in_features:int, glu:Glu|No
     if not _seg_ok(seg, K, x.device) or (off:=_byte_offset(seg[0])) is None or off % NV_QUANT_ALIGN[seg[1]]: return None
   # split each row's K over up to 4 warps when there are too few rows to keep every SM streaming (~64 warps per SM: a long row
   # per warp leaves the SMs idle at the end, bench/quant_bench.py)
+  # with several tokens a warp handles R rows, loading each token's activations once for all of them
+  R = 1 if tokens == 1 else getenv("NV_GEMV_R", 2)
   N, step, ksplit = sum(n for _, _, n in segs), max(NV_QUANT_STEP[q] for _, q, _ in segs), 1
-  while ksplit < 4 and N * ksplit < getenv("NV_QUANT_WARPS_PER_SM", 64) * num_sms(x.device) and K // step >= 2 * ksplit: ksplit *= 2
-  fxn = functools.partial(_quant_program, stage="GEMV", k=K, ntok=tokens, segs=tuple((q, n) for _, q, n in segs), ksplit=ksplit)
-  out = Tensor.custom_kernel(Tensor.empty(tokens, N, dtype=dtypes.float32, device=x.device), *(p for p, _, _ in segs),
-                             _quantize_x(x, tokens, K, glu), fxn=fxn)[0]
-  return out.reshape(*x.shape[:-1], N)
+  while ksplit < 4 and N * ksplit < getenv("NV_QUANT_WARPS_PER_SM", 64) * num_sms(x.device) * R and K // step >= 2 * ksplit: ksplit *= 2
+  fxn = functools.partial(_quant_program, stage="GEMV", k=K, ntok=tokens, segs=tuple((q, n) for _, q, n in segs), ksplit=ksplit,
+                          rows_per_warp=R)
+  srcs = (*(p for p, _, _ in segs), _quantize_x(x, tokens, K, glu))
+  out = Tensor.custom_kernel(Tensor.empty(tokens, N, dtype=dtypes.float32, device=x.device), *srcs, fxn=fxn)[0].reshape(*x.shape[:-1], N)
+  if len(segs) == 1:  # residual_add can rebuild it with the residual added in the kernel
+    if len(_GEMV_SRC) >= 8: _GEMV_SRC.pop(next(iter(_GEMV_SRC)))
+    _GEMV_SRC[out.uop] = (srcs, functools.partial(fxn, resid=True), tokens, N)
+  return out
+
+_GEMV_SRC:dict[UOp, tuple[tuple[Tensor, ...], Callable, int, int]] = {}
+def nv_residual_add(x:Tensor, y:Tensor) -> Tensor|None:
+  """x + y in one kernel when y is a quant GEMV's output (one weight, decode): the GEMV adds x as it stores, so the add's own kernel
+  doesn't run (y isn't used). None otherwise."""
+  if getenv("DISABLE_NV_RESID_FUSE") or (src:=_GEMV_SRC.get(y.uop)) is None: return None
+  srcs, fxn, tokens, N = src
+  if x.shape != y.shape or x.dtype != dtypes.float32 or x.device != y.device or x.uop.axis is not None: return None
+  # an invalids output already in x's shape: as a @function's (the LLM block's) return, a Tensor.empty buffer was copied out
+  return Tensor.custom_kernel(Tensor.invalids(*x.shape, dtype=dtypes.float32, device=x.device), *srcs, x.contiguous(), fxn=fxn)[0]
 
 def nv_quant_linear(x:Tensor, packed:Tensor, qtype:int, out_features:int, in_features:int) -> Tensor|None:
   """x @ W.T for a few tokens, W (out_features, in_features) stored as packed GGUF blocks of type qtype (Q4_K, Q6_K or Q8_0,
@@ -464,6 +535,10 @@ def nv_dequant(segs:Sequence[QuantSeg], in_features:int, dep:Tensor, interleave:
 
 # ******** int8 tensor core GEMM for prefill on GGUF quant weights (nv_mmq.cu) ********
 
+# a B segment of the int8 GEMM: (format, first column, last column, number of pointer arguments); formats as nv_mmq.cu's F_*
+MmqSeg = tuple[int, int, int, int]
+F_I8, F_I8Q6, F_Q4K, F_Q8, F_IL = 0, 1, 2, 3, 4
+
 @dataclass(frozen=True)
 class MmqCfg:
   BM: int = 128
@@ -478,18 +553,23 @@ class MmqCfg:
   def BK(self) -> int: return 32 * self.NBLK  # in int8 (= K elements)
   @property
   def threads(self) -> int: return (self.BM // self.WM) * (self.BN // self.WN) * 32
-  def brow(self, raw:bool) -> int: return 176 if raw else self.BK + self.NBLK * 8  # B stage row stride (nv_mmq.cu BROW)
-  def smem(self, raw:bool=True) -> int:  # nv_mmq.cu: A tiles + scales, B rows, per-warp decoded B scales (packed formats)
-    return self.STAGES * (self.BM * (self.BK + self.NBLK * 8) + self.BN * self.brow(raw)) + raw * self.threads // 32 * self.WN * self.NBLK * 8
+  def brow(self, fmts:Sequence[int]) -> int:  # B stage row stride (nv_mmq.cu BROW): the largest the launch's formats need
+    return max({F_Q4K: 112, F_Q8: 144}.get(f & 3, self.BK + self.NBLK * 8) for f in fmts)
+  def smem(self, fmts:Sequence[int]=(F_I8,)) -> int:  # nv_mmq.cu: A tiles + scales, B rows, decoded B scales (packed formats)
+    raw = any((f & 3) >= F_Q4K for f in fmts)
+    return self.STAGES * (self.BM * (self.BK + self.NBLK * 8) + self.BN * self.brow(fmts)) + raw * self.BN * self.NBLK * 8
   @property
   def blocks_per_sm(self) -> int: return max(1, min(48 * 32 // self.threads, (100 * 1024) // (self.smem() + 1024)))
   def __str__(self): return f"{self.BM}x{self.BN}_w{self.WM}x{self.WN}_s{self.STAGES}b{self.NBLK}" + ("_sk" if self.SK else "")
 MMQ = MmqCfg()
+# smaller row tiles for short prompts and generate()'s 32-token prefill chunks (the weights are read once either way)
+MMQ_SMALL = {16: MmqCfg(BM=16, WM=16, WN=32), 32: MmqCfg(BM=32, WM=32, WN=32), 64: MmqCfg(BM=64, WM=32, WN=32)}
+def mmq_cfg(M:int) -> MmqCfg:
+  # the 128-row tile when it pads M by at most 1/8, else the smaller tile that pads least (the larger one on ties)
+  if M >= MMQ.BM and (-M % MMQ.BM) * 8 <= M: return MMQ
+  return min((MMQ_SMALL[b] for b in (64, 32, 16)), key=lambda c: -M % c.BM)
 Q6_K_TYPE = 14
 
-# a B segment of the int8 GEMM: (format, first column, last column, number of pointer arguments); formats as nv_mmq.cu's F_*
-MmqSeg = tuple[int, int, int, int]
-F_I8, F_I8Q6, F_Q4K, F_Q8, F_IL = 0, 1, 2, 3, 4
 
 def _mmq_program(C:UOp, X:UOp, *srcs:UOp, cfg:MmqCfg, sp:Split, k:int, n:int, msegs:tuple[MmqSeg, ...], glu:Glu|None) -> UOp:
   M, (SKWS, FLAGS), wsrcs = int(C.shape[0]), srcs[-2:], srcs[:-2]
@@ -510,7 +590,7 @@ def _mmq_program(C:UOp, X:UOp, *srcs:UOp, cfg:MmqCfg, sp:Split, k:int, n:int, ms
   seg_run = "{ const unsigned char *wa; const void *wb; int nb, f; " + " else ".join(sel) + " " + run + " }"
   defines:dict[str, Any] = {"M_DIM": M, "N_DIM": n, "K_DIM": k, "BM": cfg.BM, "BN": cfg.BN, "WM": cfg.WM, "WN": cfg.WN,
                             "STAGES": cfg.STAGES, "NBLK": cfg.NBLK, "GROUP_M": cfg.GROUP_M, "SK_P": sp.sk_p, "SEG_PARAMS": ", ".join(params),
-                            "SEG_RUN(k0, k1)": seg_run, "BROW": cfg.brow(raw), "HAS_RAW": int(raw)}
+                            "SEG_RUN(k0, k1)": seg_run, "BROW": cfg.brow(fmts), "HAS_RAW": int(raw)}
   if glu is not None:
     suffix, gdefs = _glu_defines(glu)
     name, defines = name + suffix, {**defines, **gdefs}
@@ -519,7 +599,7 @@ def _mmq_program(C:UOp, X:UOp, *srcs:UOp, cfg:MmqCfg, sp:Split, k:int, n:int, ms
   io = M * k * 5 // 4 + n * k * 5 // 8 + int(C.shape[1]) * M * C.dtype.itemsize
   est = Estimates(ops=2 * M * n * k, lds=io, mem=io)
   sink = UOp.sink(C.base, X.base, *[w.base for w in wsrcs], SKWS.base, FLAGS.base, threads, blocks,
-                  arg=KernelInfo(name, estimates=est, dyn_shared_mem=cfg.smem(raw)))
+                  arg=KernelInfo(name, estimates=est, dyn_shared_mem=cfg.smem(fmts)))
   return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src)))
 
 def nv_requant(segs:Sequence[QuantSeg], in_features:int, dep:Tensor, interleave:bool=False) -> tuple[Tensor, Tensor]|None:
@@ -543,13 +623,13 @@ def nv_mmq(x:Tensor, segs:Sequence[QuantSeg], in_features:int, glu:Glu|None=None
   if x.dtype not in _CTYPE or K % MMQ.BK or N % MMQ.BN: return None
   xs = x if isinstance(x.numel(), int) else x.pad_to(x.max_shape)
   M = prod(xs.shape[:-1])
-  if not isinstance(M, int) or M < MMQ.BM: return None
-  Mp = -(-M // MMQ.BM) * MMQ.BM
-  if (Mp - M) * 8 > M: return None  # too much padding: the fp16 GEMM has smaller tiles
+  if not isinstance(M, int) or M <= NV_QUANT_MAX_TOKENS: return None  # (a few tokens: the GEMV)
+  cfg = mmq_cfg(M)
+  Mp = -(-M // cfg.BM) * cfg.BM
   # each 128-column tile reads one segment, in one format: the packed Q4_K / Q8_0 blocks as they are (16 / 8-byte aligned), else
   # (Q6_K, misaligned) the requantized int8 copy; so segment boundaries have to fall on tiles
   starts = list(itertools.accumulate((n for _, _, n in segs), initial=0))
-  if any(a % MMQ.BN for a in starts) or not all(_seg_ok(seg, K, x.device) for seg in segs): return None
+  if any(a % cfg.BN for a in starts) or not all(_seg_ok(seg, K, x.device) for seg in segs): return None
   def raw_fmt(seg:QuantSeg) -> int|None:
     if getenv("NV_MMQ_REQUANT") or (off:=_byte_offset(seg[0])) is None: return None
     return F_Q4K if seg[1] == 12 and off % 16 == 0 else F_Q8 if seg[1] == 8 and off % 8 == 0 else None
@@ -578,12 +658,12 @@ def nv_mmq(x:Tensor, segs:Sequence[QuantSeg], in_features:int, glu:Glu|None=None
       else: wl = list(wq)
       msegs.append((f, a, a + sum(g[2] for g in gsegs), len(wl)))
       wts += wl
-  sp = split(Mp, N, K, MMQ, num_sms(x.device))
-  skws = Tensor.empty(sp.sk_workers * MMQ.BM * MMQ.BN if sp.sk_workers else 1, dtype=dtypes.float32, device=x.device)
+  sp = split(Mp, N, K, cfg, num_sms(x.device))
+  skws = Tensor.empty(sp.sk_workers * cfg.BM * cfg.BN if sp.sk_workers else 1, dtype=dtypes.float32, device=x.device)
   flags = _flags(x.device) if sp.sk_workers else Tensor.empty(1, dtype=dtypes.int32, device=x.device)
   NO = N // 2 if glu is not None else N
   out = Tensor.invalids(Mp, NO, dtype=dtypes.half if glu is not None else dtypes.float32, device=x.device)
-  fxn = functools.partial(_mmq_program, cfg=MMQ, sp=sp, k=K, n=N, msegs=tuple(msegs), glu=glu)
+  fxn = functools.partial(_mmq_program, cfg=cfg, sp=sp, k=K, n=N, msegs=tuple(msegs), glu=glu)
   out = Tensor.custom_kernel(out, xq, *wts, skws, flags, fxn=fxn)[0]
   if Mp != M: out = out[:M]
   out = out.reshape(*xs.shape[:-1], NO)
@@ -625,7 +705,7 @@ def _quantize_x(x:Tensor, tokens:int, K:int, glu:Glu|None) -> Tensor:
     xq = Tensor.custom_kernel(xq, nx.reshape(tokens, K).contiguous(), stored.contiguous(),
                               fxn=functools.partial(fxn, norm=(eps, nx.dtype, stored.dtype, w.dtype)))[0]
   elif glu is None and not getenv("DISABLE_NV_ATTN_FUSE") and (asrc:=_ATTN_SRC.get(x.uop)) is not None and \
-       asrc[2].nh * asrc[2].hd == K and asrc[2].nb == tokens:
+       asrc[2].nh * asrc[2].hd == K and asrc[2].nb * asrc[2].nt == tokens:
     part, params, cfg = asrc
     xq = Tensor.custom_kernel(xq, part, params, fxn=functools.partial(fxn, attn=cfg))[0]
   elif x.dtype == dtypes.half and glu is None:  # read as is (e.g. the prefill SwiGLU's fp16 output): no cast kernel

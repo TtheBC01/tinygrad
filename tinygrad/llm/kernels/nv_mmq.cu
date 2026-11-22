@@ -15,6 +15,9 @@
 #ifndef SK_P
 #define SK_P 0
 #endif
+#ifndef SK_PART
+#define SK_PART 0
+#endif
 #ifndef NBLK
 #define NBLK 2                 // quant blocks (32 int8 of K) per pipeline stage: 2 or 4
 #endif
@@ -45,16 +48,19 @@ typedef float out_t;
 __device__ __forceinline__ void store2(float *p, float x, float y) { *(float2 *)p = make_float2(x, y); }
 __device__ __forceinline__ void store2(half *p, float x, float y) { *(half2 *)p = __floats2half2_rn(x, y); }
 
+// The int32 accumulators start at 0x4B400000, the bits of 1.5 * 2^23, so the tensor core adds the int -> float trick's offset: for
+// |dot| < 2^22 (a block's is at most 32*127*127) the result's bits are the float 1.5 * 2^23 + dot, and i2f is one FADD instead
+// of a quarter-rate I2F.
+#define I2F_MAGIC 0x4B400000
 __device__ __forceinline__ void mma_s8_k32(int (&c)[4], const unsigned (&a)[4], const unsigned (&b)[2]) {
   asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
-      : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(0));
+      : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(I2F_MAGIC));
 }
 __device__ __forceinline__ void mma_s8_k16(int (&c)[4], unsigned a0, unsigned a1, unsigned b) {
   asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
-      : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3]) : "r"(a0), "r"(a1), "r"(b), "r"(0));
+      : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3]) : "r"(a0), "r"(a1), "r"(b), "r"(I2F_MAGIC));
 }
-// exact int32 -> fp32 for |i| < 2^22 (a block's dot is at most 32*127*127): two ALU ops instead of a quarter-rate I2F
-__device__ __forceinline__ float i2f(int i) { return __int_as_float(i + 0x4B400000) - 12582912.0f; }
+__device__ __forceinline__ float i2f(int c) { return __int_as_float(c) - 12582912.0f; }  // c = I2F_MAGIC + dot
 
 // K-contiguous stage rows of BKH halves, 16-byte chunks XOR-swizzled so ldmatrix's 8 rows at one chunk hit distinct banks (in halves)
 #if NBLK == 2
@@ -95,12 +101,12 @@ __device__ __forceinline__ void tile_coords(int t, int &bm, int &bn) {
 #define F_IL 4
 
 #ifndef BROW
-#define BROW 176  // B stage row stride in bytes: 176 with packed formats (44 words: the fragment loads' 8 rows hit distinct banks),
-#endif            // else KB + NBLK * 8 (requantized data + scales)
+#define BROW 176  // B stage row stride in bytes, from the launch's formats (nv.py): Q4_K 112 (28 words), Q8_0 144 (36 words): the
+#endif            // fragment loads' 8 rows hit distinct banks; requantized KB + NBLK * 8 (data + scales)
 #ifndef HAS_RAW
 #define HAS_RAW 1  // any packed-format segment: the per-warp decoded scales are allocated
 #endif
-static_assert(BROW >= KB + NBLK * 8 && BROW % 16 == 0, "a requantized row (data + scales) fits the B row stride");
+static_assert(BROW % 16 == 0 && BROW >= 80, "a B stage row: Q4_K 80 bytes, Q8_0 136, requantized KB + NBLK * 8");
 __device__ __forceinline__ void cp_async8(void *smem, const void *gmem) {
   unsigned s = (unsigned)__cvta_generic_to_shared(smem);
   asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(s), "l"(gmem));
@@ -111,8 +117,8 @@ __device__ __forceinline__ unsigned lds16x2(const unsigned char *p) {  // 4 byte
 }
 
 // X: [M][XROW] bytes. smem per stage: A BM x KB int8 (swizzled), B BN x BROW bytes (requantized: BN x KB swizzled int8, then BN x
-// NBLK float2; packed: each row's raw bytes for the stage), A scales BM x NBLK float2. Then per warp WN x NBLK float2 B scales
-// decoded from the packed headers.
+// NBLK float2; packed: each row's raw bytes for the stage), A scales BM x NBLK float2. Then BN x NBLK float2 B scales decoded from
+// the packed headers: each warp decodes its WN columns' (the warps sharing columns write the same values, after the same barrier).
 // The per-tile work is templated on the segment format F; St holds what the kernel's steps share (inlined: registers).
 struct St {
   const unsigned char *X;
@@ -121,7 +127,7 @@ struct St {
   float2 *Asc, *wsc;
   int tid, lane, wm, wn, bm, bn;
   float acc[MT][NT][4];
-  unsigned af[2][MT][4], bf[2][NT][2];
+  unsigned af[2][MT][4], bf[2][NT][2];  // two fragment buffers when double-buffered (FRAG_DB), else only [0] is used
 };
 
 // wa/wb: the segment's pointers (requantized: int8 rows, float2 scales; packed: the blocks, and the second weight with F_IL),
@@ -274,12 +280,16 @@ template <int F> __device__ __forceinline__ void mainloop(St &t, const unsigned 
   cp_async_wait<STAGES - 2>();  // tile 0 has landed
   __syncthreads();
   decode_scales<F>(t, 0, k0);
-  load_frags<F>(t, 0, 0, 0);
+  // double-buffered fragments (the next block's loaded during this one's mmas) are faster for the two-scale Q6_K path; the others
+  // run better with one buffer: fewer registers (they spilled), the loads' latency hidden by the other warps
+  constexpr bool FRAG_DB = F == F_I8Q6;
+  if constexpr (FRAG_DB) load_frags<F>(t, 0, 0, 0);
   for (int i = 0; i < n; i++) {
     // slot (i-1)%STAGES was last read before the barrier at the end of iteration i-1, so it's free to overwrite
     const int ni = i + STAGES - 1;
     if (ni < n) load_tile<F>(t, wa, wb, nb, ni % STAGES, k0 + ni);
     cp_async_commit();
+    if constexpr (FRAG_DB) {
 #pragma unroll
     for (int kk = 0; kk < NBLK; kk++) {
       if (kk < NBLK - 1) {  // the next block's fragments load while this block's mmas run
@@ -294,6 +304,16 @@ template <int F> __device__ __forceinline__ void mainloop(St &t, const unsigned 
           load_frags<F>(t, 0, (i + 1) % STAGES, 0);
         }
       }
+    }
+    } else {
+#pragma unroll
+    for (int kk = 0; kk < NBLK; kk++) {
+      load_frags<F>(t, 0, i % STAGES, kk);
+      block<F>(t, 0, i % STAGES, kk);
+    }
+    cp_async_wait<STAGES - 2>();  // tile i+1 has landed
+    __syncthreads();              // and every warp is done with stage i
+    if (i + 1 < n) decode_scales<F>(t, (i + 1) % STAGES, k0 + i + 1);
     }
   }
   __syncthreads();
@@ -310,7 +330,7 @@ KNAME(out_t *__restrict__ C, const unsigned char *__restrict__ X, SEG_PARAMS, fl
   t.Asc = (float2 *)(t.Bs + STAGES * BN * BROW);
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   t.tid = tid, t.lane = lane, t.wm = warp / (BN / WN), t.wn = warp % (BN / WN);
-  t.wsc = t.Asc + STAGES * BM * NBLK + warp * WN * NBLK;  // this warp's decoded B scales: [WN][NBLK]
+  t.wsc = t.Asc + STAGES * BM * NBLK + t.wn * WN * NBLK;  // the decoded B scales of this warp's columns: [WN][NBLK]
   int &bm = t.bm, &bn = t.bn;
   const int wm = t.wm, wn = t.wn;
   float (&acc)[MT][NT][4] = t.acc;
@@ -335,14 +355,20 @@ KNAME(out_t *__restrict__ C, const unsigned char *__restrict__ X, SEG_PARAMS, fl
       }
   };
 
+  // SK_PART 1 launches the whole tiles (grid DP_TILES), SK_PART 2 the stream-K workers (grid SK_WORKERS), one after the other: each
+  // kernel then has one copy of the main loop (both in one kernel spilled registers in the loop). SK_PART 0: both, one launch.
+#if SK_PART == 2
   const int pid = blockIdx.x;
+#else
+  const int pid = blockIdx.x + (SK_PART == 1 ? SK_WORKERS : 0);
   if (pid >= SK_WORKERS) {
     tile_coords(SK_TILES + pid - SK_WORKERS, bm, bn);
     SEG_RUN(0, KT)
     store_tile();
     return;
   }
-#if SK_P > 0
+#endif
+#if SK_P > 0 && SK_PART != 1
   // stream-K tail, as nv_gemm.cu: partial fp32 tiles handed to the worker that did the tile's head
   auto it_begin = [](int w) { return (int)(SK_ITERS * w / SK_WORKERS); };
   const int end = it_begin(pid + 1);

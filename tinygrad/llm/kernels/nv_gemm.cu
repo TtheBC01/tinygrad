@@ -9,6 +9,9 @@
 // With GLU (#define GLU, GLU_ALPHA, GLU_UP_BIAS, optionally GLU_LIMIT), the columns of op(A) @ op(B) are interleaved (gate, up) pairs
 // and C[M][N/2] is their SwiGLU, model.gated_activation's g * sigmoid(GLU_ALPHA g) * (u + GLU_UP_BIAS) after the optional clamp:
 // the LLM's gate/up projection writes its activation directly (nv.py interleaves the weight's rows when it dequantizes them).
+// With CONV, an implicit-GEMM convolution: A is the NHWC input X [NB][CONV_H][CONV_W][CONV_CIN] read as its im2col matrix (row m =
+// output pixel (n, oh, ow), K = (kh, kw, ci): each 16-byte chunk is 8 channels of one input pixel, zero-filled outside the image or
+// past the CONV_M pixels; M_DIM rounds CONV_M up to BM), B the weights [COUT][KH][KW][CIN] ([N][K], TRANS_B), C the NCHW output.
 // The host side (tinygrad/llm/kernels/nv.py) prepends #defines for KNAME, M_DIM, N_DIM, K_DIM and the tile config.
 // (nv_common.cuh, with the cp.async / ldmatrix / mma helpers, is prepended by nv.py)
 
@@ -75,6 +78,14 @@ __device__ __forceinline__ float glu_act(float g, float u) {
 #ifndef SK_P
 #define SK_P 0  // concurrent block slots on the GPU (SMs x resident blocks per SM); 0 disables stream-K
 #endif
+#ifdef CONV
+static_assert(!TRANS_A && TRANS_B && CONV_CIN % 8 == 0 && SK_P == 0, "conv: im2col A, [COUT][K] weights, 8-channel chunks");
+#define CONV_OHW (CONV_OH * CONV_OW)
+__device__ __forceinline__ void cp_async16_zfill(void *smem, const void *gmem, bool valid) {  // 16 bytes, or zeros
+  unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(valid ? 16 : 0));
+}
+#endif
 
 #define NWARPS ((BM / WM) * (BN / WN))
 #define NTHREADS (NWARPS * 32)
@@ -135,6 +146,21 @@ KNAME(out_t *__restrict__ C, const in_t *__restrict__ A, const in_t *__restrict_
   int bm, bn;
   float acc[MT][NT][4];
   unsigned af[2][MT][4], bf[2][NT][2];
+#ifdef CONV
+  // this thread's im2col rows (output pixels) are fixed for a tile: their input pixel at tap (0, 0), decoded once per tile
+  constexpr int CROWS = (BM * BK / 8) / NTHREADS;
+  int c_ih[CROWS], c_iw[CROWS];
+  const in_t *c_base[CROWS];
+  auto conv_rows = [&]() {
+#pragma unroll
+    for (int i = 0; i < CROWS; i++) {
+      const int m = bm + (tid + i * NTHREADS) / (BK / 8), n = m / CONV_OHW, p = m % CONV_OHW;
+      c_ih[i] = m < CONV_M ? (p / CONV_OW) * CONV_S - CONV_P : -(1 << 20);  // (rows past CONV_M: never in the image)
+      c_iw[i] = (p % CONV_OW) * CONV_S - CONV_P;
+      c_base[i] = A + (((size_t)n * CONV_H + c_ih[i]) * CONV_W + c_iw[i]) * CONV_CIN;
+    }
+  };
+#endif
 
   auto load_tile = [&](int stage, int kt) {
     in_t *as = As + stage * BM * BK, *bs = Bs + stage * BK * BN;
@@ -143,6 +169,12 @@ KNAME(out_t *__restrict__ C, const in_t *__restrict__ A, const in_t *__restrict_
 #if TRANS_A  // A stored [K][M]: BK rows of BM
       int c = tid + i * NTHREADS, row = c / (BM / 8), ch = c % (BM / 8);
       cp_async16(as + oc_off<BM>(row, ch), A + (size_t)(kt * BK + row) * M_DIM + bm + ch * 8);
+#elif defined(CONV)  // A = im2col of the NHWC input: row m = output pixel, the chunk's 8 channels of one tap
+      // (a k tile is one tap (kh, kw) when CIN % BK == 0, else the tap is per chunk)
+      const int c = tid + i * NTHREADS, row = c / (BK / 8), ch = c % (BK / 8), k = kt * BK + ch * 8;
+      const int khw = k / CONV_CIN, kh = khw / CONV_KW, kw = khw % CONV_KW, ih = c_ih[i] + kh, iw = c_iw[i] + kw;
+      const bool v = ih >= 0 && ih < CONV_H && iw >= 0 && iw < CONV_W;
+      cp_async16_zfill(as + kc_off(row, ch), v ? c_base[i] + (kh * CONV_W + kw) * CONV_CIN + k % CONV_CIN : A, v);
 #else        // A stored [M][K]: BM rows of BK
       int c = tid + i * NTHREADS, row = c / (BK / 8), ch = c % (BK / 8);
       cp_async16(as + kc_off(row, ch), A + (size_t)(bm + row) * K_DIM + kt * BK + ch * 8);
@@ -187,6 +219,9 @@ KNAME(out_t *__restrict__ C, const in_t *__restrict__ A, const in_t *__restrict_
 
   // acc = A[bm:bm+BM, k0*BK:k1*BK] @ B[k0*BK:k1*BK, bn:bn+BN]
   auto mainloop = [&](int k0, int k1) {
+#ifdef CONV
+    conv_rows();
+#endif
 #pragma unroll
     for (int i = 0; i < MT; i++)
 #pragma unroll
@@ -239,6 +274,12 @@ KNAME(out_t *__restrict__ C, const in_t *__restrict__ A, const in_t *__restrict_
         if (!(lane & 1)) {
           store2(&C[(size_t)row * C_COLS + col / 2], a0, b0);
           store2(&C[(size_t)(row + 8) * C_COLS + col / 2], a1, b1);
+        }
+#elif defined(CONV)  // NCHW: C[m][co] -> Y[n][co][p]; the 8 lanes with one (lane & 3) store 8 consecutive pixels of a channel
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+          const int r = row + 8 * (e >> 1), co = col + (e & 1);
+          if (r < CONV_M) C[((size_t)(r / CONV_OHW) * N_DIM + co) * CONV_OHW + r % CONV_OHW] = (out_t)acc[mt][nt][e];
         }
 #else
         store2(&C[(size_t)row * N_DIM + col], acc[mt][nt][0], acc[mt][nt][1]);

@@ -1,10 +1,10 @@
 from __future__ import annotations
 import enum, functools, itertools, json, math, pathlib, re
 from dataclasses import dataclass, replace
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.amd import RMSNorm, fused_linear, glu_ffn
+from tinygrad.llm.kernels.amd import RMSNorm, fused_linear, glu_ffn, residual_add
 from tinygrad.llm.kernels.nv import nv_flash_attention
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
@@ -365,7 +365,7 @@ class FFNBlock:
         h = self.attn_norm(h)
         mask = self._indexer_mask(h, start_pos, idx_mask)
         return self._attention(h, start_pos, mask), mask
-      res_attn = res_ffn = lambda xs, sublayer: (xs + (ret:=sublayer(xs))[0], ret[1])
+      res_attn = res_ffn = lambda xs, sublayer: (residual_add(xs, (ret:=sublayer(xs))[0]), ret[1])
       if self.config.hc is not None: res_attn, res_ffn = self.hc_attn, self.hc_ffn
       elif self.config.attn_res_block_size: res_attn, res_ffn = self.attn_res_score, self.ffn_res_score
       x, idx_mask = res_attn(x, attend)
@@ -797,11 +797,15 @@ class Transformer:
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     self._position_count: int|None = None
-    # we specialize the JIT for prefill and rollout
+    # we specialize the JIT for prefill and rollout, and speculative decoding's verification (a static token count)
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
+    self.verify_jits:dict[int, Any] = {}  # TinyJit per token count
+    # speculative decoding: with a draft model set, greedy generate() runs generate_speculative with draft_k proposals per round
+    self.draft:Transformer|None = None
+    self.draft_k = 5
 
-  def forward(self, tokens:Tensor, temperature:Tensor, *start_pos:int|UOp) -> Tensor:
+  def _trunk(self, tokens:Tensor, start_pos:tuple[int|UOp, ...]) -> Tensor:
     x = self.token_embd(t:=tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     elif self.config.attn_res_block_size: x = x.unsqueeze(2)
@@ -809,6 +813,18 @@ class Transformer:
     for block in self.blk: x, idx_mask = block(x, start_pos, idx_mask, t)
     if hc is not None: x = self.output_hc.mix(x)[0] if hasattr(self, 'output_hc') else x.mean(2)
     elif self.config.attn_res_block_size: x = self.output_res_score.mix(x)
+    return x
+
+  def forward_verify(self, tokens:Tensor, *start_pos:int|UOp) -> Tensor:
+    # the greedy next token after every position of tokens (B, T) -> (B, T): checks a draft's tokens in one pass
+    return self.output(self.output_norm(self._trunk(tokens, start_pos))).argmax(-1).to(tokens.device)
+
+  def verify(self, tokens:Tensor, start_pos:UOp) -> Tensor:
+    if (jit:=self.verify_jits.get(T:=int(tokens.shape[1]))) is None: jit = self.verify_jits[T] = TinyJit(self.forward_verify)
+    return jit(tokens.contiguous(), start_pos)
+
+  def forward(self, tokens:Tensor, temperature:Tensor, *start_pos:int|UOp) -> Tensor:
+    x = self._trunk(tokens, start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
@@ -1068,7 +1084,65 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
+  def _spec_draft(self, src:Tensor, props:Tensor, temp:Tensor, j:UOp, i:UOp, pos:UOp) -> Tensor:
+    # speculative decoding, the draft's step: decode token src[:, j] at pos and store the proposal in props[:, i]
+    out = self.forward(src[:, j:j+1].contiguous(), temp, pos)
+    props[:, i:i+1].assign(out.cast(props.dtype)).realize()
+    return out
+
+  def _spec_verify(self, src:Tensor, props:Tensor, j:UOp, pos:UOp) -> Tensor:
+    # the target's check of [src[:, j], props...] at pos: its greedy tokens g (k+1), then m = how many tokens to keep: the drafted
+    # tokens it agrees with plus its correction (or all k drafted ones; the draft hasn't seen the last, so no bonus token)
+    k = int(props.shape[1])
+    g = self.forward_verify(src[:, j:j+1].cat(props, dim=1), pos).cast(dtypes.int32)
+    n = (g[:, :k] == props).cast(dtypes.int32).cumprod(1).sum(1, keepdim=True)
+    return g.cat((n + 1).minimum(k), dim=1)
+
+  def generate_speculative(self, draft:Transformer, tokens:list[int], k:int=4, chunk_size:int=32):
+    """Greedy generation (temperature 0) with speculative decoding: draft (a small model with the same tokenizer) proposes k tokens
+    one at a time, this model checks them in one forward over k+1 tokens and keeps the drafted tokens it agrees with plus its own
+    next token, so the output is this model's greedy output while its weights are read once per round. Each round stays on the GPU
+    (the draft's steps and the check are JITs that pass tokens through device buffers); one readback per round."""
+    assert self.max_context <= draft.max_context and not self.has_recurrent_block and not draft.has_recurrent_block and k >= 1
+    temp = Tensor([0.0]).realize()
+    v_pos, v_toks = UOp.variable("start_pos", 0, self.max_context-1), UOp.variable("toks", 1, chunk_size)
+    v_j, v_i = UOp.variable("spec_j", 0, k), UOp.variable("spec_i", 0, k-1)
+    def prefill(m:Transformer, toks:list[int], start:int) -> int:  # process toks[start:], return the next token
+      t = Tensor(toks + [0] * (m.max_context - len(toks)), dtype="int32").reshape(1, m.max_context)
+      out = None
+      while start < len(toks):
+        n = min(chunk_size, len(toks) - start)
+        out = m(t[:, v_pos.bind(start):v_pos.bind(start)+v_toks.bind(n)], (v_pos.bind(start),), temp).realize()
+        start += n
+      return int(unwrap(out).item())
+    start = min(self.get_start_pos(tokens), draft.get_start_pos(tokens))
+    tokens.append(prefill(self, tokens, start))
+    prefill(draft, tokens[:-1], start)
+    yield tokens[-1]
+    key = (id(draft), k)
+    if getattr(self, "_spec_key", None) != key:  # JITs for this draft and k
+      self._spec_key = key
+      self._spec_jits = (TinyJit(draft._spec_draft), TinyJit(draft._spec_draft), TinyJit(self._spec_verify))
+      self._spec_props = Tensor.zeros(1, k, dtype=dtypes.int32).contiguous().realize()
+    first, nxt, verify = self._spec_jits
+    props = self._spec_props
+    gb, j, pos = Tensor([[tokens[-1]] + [0] * (k + 1)], dtype="int32").realize(), 0, len(tokens) - 1
+    while pos + k + 1 <= self.max_context:
+      out = first(gb, props, temp, v_j.bind(j), v_i.bind(0), v_pos.bind(pos))
+      for i in range(1, k): out = nxt(out, props, temp, v_j.bind(0), v_i.bind(i), v_pos.bind(pos + i))
+      gb = verify(gb, props, v_j.bind(j), v_pos.bind(pos))
+      vals = [int(v) for v in cast(list, gb.tolist())[0]]
+      m = vals[-1]
+      self._cached_tokens = draft._cached_tokens = tokens + vals[:m - 1]
+      for tk in vals[:m]:
+        tokens.append(tk)
+        yield tk
+      j, pos = m - 1, pos + m
+
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+    if self.draft is not None and temperature == 0.0:
+      yield from self.generate_speculative(self.draft, tokens, self.draft_k, chunk_size)
+      return
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)

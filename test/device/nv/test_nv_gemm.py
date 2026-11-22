@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, TinyJit, UOp, dtypes
 from tinygrad.llm.kernels.nv import ampere_matmul, nv_linear, nv_flash_attention, nv_gemm_supported, _gemm, Cfg, BIG, MID, SMALL, ROWS32, ROWS64
-from tinygrad.llm.kernels.nv import nv_quant_linear, Q8_0, Q4_K, Q6_K
+from tinygrad.llm.kernels.nv import nv_quant_linear, Q8_0, Q4_K, Q5_K, Q6_K
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear
 
@@ -117,14 +117,16 @@ class TestNVFlashAttention(unittest.TestCase):
       with self.subTest(B=B, H=H, KVH=KVH, D=D, T=T, prefix=prefix): self._check(B, H, KVH, D, T, prefix)
 
   def test_decode(self):
-    # one query token (flash decoding): KV lengths below, at and above the split count, GQA groups of 1-4, a stale cache tail
-    for B, H, KVH, D, valid_end in ((1, 24, 8, 128, 1025), (1, 24, 8, 128, 3), (2, 8, 2, 64, 300), (1, 8, 8, 64, 1), (1, 32, 8, 64, 4096)):
-      with self.subTest(B=B, H=H, KVH=KVH, D=D, valid_end=valid_end):
-        rng = np.random.default_rng(valid_end + D)
-        q = rng.standard_normal((B, H, 1, D)).astype(np.float32)
+    # a few query tokens (flash decoding; T > 1 is speculative decoding's check, causal among them): KV lengths below, at and above
+    # the split count, GQA groups of 1-4, a stale cache tail
+    for B, H, KVH, D, valid_end, T in ((1, 24, 8, 128, 1025, 1), (1, 24, 8, 128, 3, 1), (2, 8, 2, 64, 300, 1), (1, 8, 8, 64, 1, 1),
+                                       (1, 32, 8, 64, 4096, 1), (1, 32, 8, 64, 700, 5), (2, 24, 8, 128, 9, 8), (1, 8, 2, 64, 3, 3)):
+      with self.subTest(B=B, H=H, KVH=KVH, D=D, valid_end=valid_end, T=T):
+        rng = np.random.default_rng(valid_end + D + T)
+        q = rng.standard_normal((B, H, T, D)).astype(np.float32)
         cache = rng.standard_normal((2, B, KVH, 4096, D)).astype(np.float16)
         out = nv_flash_attention(Tensor(q), Tensor(cache), valid_end)
-        assert out is not None and out.shape == (B, 1, H * D)
+        assert out is not None and out.shape == (B, T, H * D)
         np.testing.assert_allclose(_heads(out.numpy(), H), _attention_ref(q, cache, valid_end), atol=3e-3, rtol=1e-2)
 
   def test_decode_symbolic_jit(self):
@@ -151,14 +153,33 @@ class TestNVFlashAttention(unittest.TestCase):
       out = _heads(jf(Tensor(q)[:, :, :t].contiguous(), p, t).numpy()[:, :T], H)
       np.testing.assert_allclose(out, _attention_ref(q[:, :, :T], cache.numpy(), pos + T), atol=3e-3, rtol=1e-2)
 
+class TestNVConv(unittest.TestCase):
+  def setUp(self):
+    if not nv_gemm_supported(Tensor.empty(1).device): self.skipTest("NV/CUDA sm_80+ with the CUDA C renderer required")
+
+  def test_conv2d(self):
+    # implicit GEMM: 3x3 and 1x1, stride 1 and 2, the image edges (zero padding), a partial last pixel tile, both tile widths
+    from tinygrad.llm.kernels.nv import nv_conv2d
+    for nb, cin, hw, cout, k, s in ((2, 64, 14, 64, 3, 1), (1, 32, 9, 128, 3, 2), (3, 64, 7, 128, 1, 1), (2, 128, 8, 64, 3, 1),
+                                    (32, 64, 16, 128, 3, 1)):
+      with self.subTest(nb=nb, cin=cin, hw=hw, cout=cout, k=k, s=s):
+        rng = np.random.default_rng(cin + hw + k)
+        x = Tensor(rng.standard_normal((nb, cin, hw, hw)).astype(np.float16)).realize()
+        w = Tensor((rng.standard_normal((cout, cin, k, k)) * 0.05).astype(np.float16)).realize()
+        out = nv_conv2d(x, w, s, k // 2)
+        assert out is not None and out.dtype == dtypes.half
+        ref = x.float().conv2d(w.float(), stride=s, padding=k // 2).numpy()
+        np.testing.assert_allclose(out.float().numpy(), ref, atol=0.01, rtol=0.01)
+    self.assertIsNone(nv_conv2d(Tensor.empty(1, 3, 8, 8, dtype=dtypes.half), Tensor.empty(64, 3, 3, 3, dtype=dtypes.half), 1, 1))  # Cin 3
+
 def _quant_blocks(qtype:int, n:int, k:int, seed=0) -> np.ndarray:
   # random GGUF blocks for an (n, k) weight, with small finite fp16 scales (random bytes elsewhere: every bit pattern is a valid weight)
-  bsz, nbytes = {Q8_0: (32, 34), Q4_K: (256, 144), Q6_K: (256, 210)}[qtype]
+  bsz, nbytes = {Q8_0: (32, 34), Q4_K: (256, 144), Q5_K: (256, 176), Q6_K: (256, 210)}[qtype]
   rng = np.random.default_rng(seed)
   blocks = rng.integers(0, 256, (n * k // bsz, nbytes), dtype=np.uint8)
   def put_half(off, lo, hi): blocks[:, off:off+2] = rng.uniform(lo, hi, len(blocks)).astype(np.float16).view(np.uint8).reshape(-1, 2)
   if qtype == Q8_0: put_half(0, 0.001, 0.01)
-  if qtype == Q4_K:
+  if qtype in (Q4_K, Q5_K):
     for off in (0, 2): put_half(off, 0.001, 0.01)
   if qtype == Q6_K: put_half(208, 0.0005, 0.005)
   return blocks.reshape(-1)
@@ -179,14 +200,14 @@ class TestNVQuant(unittest.TestCase):
     np.testing.assert_allclose(out.numpy(), ref, atol=0.01 * np.abs(ref).max(), rtol=0)
 
   def test_types_shapes(self):
-    for qtype in (Q8_0, Q4_K, Q6_K):
+    for qtype in (Q8_0, Q4_K, Q5_K, Q6_K):
       for n, k, tokens in ((512, 2048, 1), (3072, 3072, 1), (1024, 8192, 3), (130, 1024, 8)):
         with self.subTest(qtype=qtype, n=n, k=k, tokens=tokens): self._check(qtype, n, k, tokens)
 
   def test_linear_finds_packed(self):
     # a Linear whose weight is the GGUF dequantization runs the quant kernel for decode and the fp16 GEMM for prefill
     n, k = 768, 1024
-    for qtype in (Q8_0, Q4_K, Q6_K):
+    for qtype in (Q8_0, Q4_K, Q5_K, Q6_K):
       with self.subTest(qtype=qtype):
         raw = _quant_blocks(qtype, n, k, seed=2)
         lin = Linear(k, n, bias=False)
@@ -197,6 +218,24 @@ class TestNVQuant(unittest.TestCase):
           x = np.random.default_rng(3).standard_normal((1, tokens, k)).astype(np.float32)
           ref = x @ w.T
           np.testing.assert_allclose(lin(Tensor(x)).numpy(), ref, atol=0.01 * np.abs(ref).max(), rtol=0)
+
+  def test_dequant_requant(self):
+    # the fp16 dequantize and the int8 requant (w = s*q - m per 32, or two scales per 16 for Q6_K) against the GGUF loader's
+    from tinygrad.llm.kernels.nv import nv_dequant, nv_requant
+    n, k = 256, 1024
+    for qtype in (Q8_0, Q4_K, Q5_K, Q6_K):
+      with self.subTest(qtype=qtype):
+        raw = Tensor(_quant_blocks(qtype, n, k, seed=9)).realize()
+        ref = ggml_data_to_tensor(raw, n * k, qtype).reshape(n, k).float().numpy()
+        dq = nv_dequant([(raw, qtype, n)], k, Tensor.empty(1))
+        assert dq is not None
+        np.testing.assert_allclose(dq.float().numpy(), ref, atol=1e-3, rtol=1e-3)
+        rq = nv_requant([(raw, qtype, n)], k, Tensor.empty(1))
+        assert rq is not None
+        q, sc = rq[0].numpy().astype(np.float32).reshape(n, k // 32, 32), rq[1].numpy()
+        if qtype == Q6_K: w = np.concatenate([q[..., :16] * sc[..., :1], q[..., 16:] * sc[..., 1:]], -1)
+        else: w = q * sc[..., :1] - sc[..., 1:]
+        np.testing.assert_allclose(w.reshape(n, k), ref, atol=2e-3, rtol=2e-3)
 
   def test_rope_permuted_weight(self):
     # a GGUF q/k projection: the loader permutes the rows for RoPE, the kernel reads the unpermuted blocks and permutes its output
@@ -214,20 +253,20 @@ class TestNVQuant(unittest.TestCase):
           ref = x @ w.T
           np.testing.assert_allclose(lin(Tensor(x)).numpy(), ref, atol=0.01 * np.abs(ref).max(), rtol=0)
 
-  def test_prefill_dequant_waits_for_input(self):
-    # each layer's fp16 copy of a quant weight is made after the previous layer's GEMM (it waits for the layer's input), so the
-    # copies don't all live at once: two chained layers schedule as dequant, gemm, dequant, gemm
+  def test_prefill_requant_waits_for_input(self):
+    # each layer's int8 copy of a Q6_K weight (the int8 GEMM's requant) is made after the previous layer's GEMM (it waits for the
+    # layer's input), so the copies don't all live at once: two chained layers schedule as quantize, requant, gemm, twice
     from tinygrad.uop.ops import Ops
     n = k = 1024
     layers = []
     for i in range(2):
       lin = Linear(k, n, bias=False)
-      lin.weight = ggml_data_to_tensor(Tensor(_quant_blocks(Q4_K, n, k, seed=i)).realize(), n * k, Q4_K).reshape(n, k).cast(dtypes.half)
+      lin.weight = ggml_data_to_tensor(Tensor(_quant_blocks(Q6_K, n, k, seed=i)).realize(), n * k, Q6_K).reshape(n, k).cast(dtypes.half)
       layers.append(lin)
     out = layers[1](layers[0](Tensor.randn(1, 64, k).realize()))
     names = [u.src[0].src[0].arg.name for u in out.schedule_linear().src if u.src[0].op is Ops.PROGRAM]
-    order = [nm.split("_")[0] + ("_dequant" if "dequant" in nm else "") for nm in names]
-    self.assertEqual(order, ["nv_dequant", "ampere", "nv_dequant", "ampere"])
+    order = ["_".join(nm.split("_")[:3 if nm.startswith("nv_q") else 2]) for nm in names]
+    self.assertEqual(order, ["nv_q8_quantize", "nv_q14_requant", "nv_mmq", "nv_q8_quantize", "nv_q14_requant", "nv_mmq"])
 
   def _shared_linears(self, specs, k, seed=0, bias=False):
     # Linears whose weights are GGUF blocks of the given (qtype, rows), stored back to back in one buffer like a GGUF file
@@ -261,11 +300,11 @@ class TestNVQuant(unittest.TestCase):
             np.testing.assert_allclose(out.numpy(), ref, atol=0.01 * np.abs(ref).max(), rtol=0)
 
   def test_fused_kernel_count(self):
-    # decode: q/k/v in one quantize and one GEMV; prefill: one dequantize and one GEMM
+    # decode: q/k/v in one quantize and one GEMV; prefill: one quantize, the Q6_K weight's requant, one int8 GEMM
     from tinygrad.llm.kernels.amd import fused_linear
     from tinygrad.uop.ops import Ops
     lins = self._shared_linears(((Q4_K, 512), (Q4_K, 128), (Q6_K, 128)), 1024)
-    for tokens, expect in ((1, ["nv_q8_quantize", "nv_q12x12x14_gemv"]), (64, ["nv_q12x12x14_dequant", "ampere"])):
+    for tokens, expect in ((1, ["nv_q8_quantize", "nv_q12x12x14_gemv"]), (64, ["nv_q8_quantize", "nv_q14_requant", "nv_mmq"])):
       with self.subTest(tokens=tokens):
         outs = fused_linear(Tensor.randn(1, tokens, 1024).realize(), *lins)
         names = [u.src[0].src[0].arg.name for u in Tensor.schedule_linear(*outs).src if u.src[0].op is Ops.PROGRAM]
@@ -296,8 +335,10 @@ class TestNVQuant(unittest.TestCase):
           if tokens == 32:
             sched = Tensor.schedule_linear(glu_ffn(Tensor(x).realize(), gate, up, down, act, glu))
             names = [u.src[0].src[0].arg.name for u in sched.src if u.src[0].op is Ops.PROGRAM]
-            self.assertEqual(len(names), 4, names)  # the interleaved dequantize, the SwiGLU GEMM, down's dequantize and GEMM
-            self.assertTrue(names[0].endswith("_il") and "_glu" in names[1] and names[2].startswith("nv_q") and "_f32_" in names[3], names)
+            # x's quantize, the int8 SwiGLU GEMM on the interleaved packed gate/up, the fp16 activation's quantize, down's GEMM
+            # (after its requant for Q6_K): no fp16 dequantize or GEMM
+            self.assertTrue(names[1].startswith("nv_mmq") and "il_glu" in names[1] and names[2].endswith("_half") and
+                            names[-1].startswith("nv_mmq") and not any(n.startswith("ampere") or "dequant" in n for n in names), names)
           out = glu_ffn(Tensor(x), gate, up, down, act, glu)
           self.assertEqual(out.dtype, dtypes.float32)
           np.testing.assert_allclose(out.numpy(), ref, atol=0.02 * np.abs(ref).max(), rtol=0)
@@ -329,6 +370,25 @@ class TestNVQuant(unittest.TestCase):
           for lin, out in zip(lins, outs):
             ref = h @ lin.weight.float().numpy().T
             np.testing.assert_allclose(out.float().numpy(), ref, atol=0.015 * np.abs(ref).max(), rtol=0)
+
+  def test_residual_add(self):
+    # x + lin(h) in decode: the GEMV adds x as it stores (no add kernel); prefill and non-GEMV values take the plain add
+    from tinygrad.llm.kernels.amd import residual_add
+    from tinygrad.uop.ops import Ops
+    lin = self._shared_linears(((Q4_K, 1024),), 2048, seed=80)[0]
+    w = lin.weight.float().numpy()
+    for tokens in (1, 3, 32):
+      with self.subTest(tokens=tokens):
+        rng = np.random.default_rng(tokens)
+        x, h = (rng.standard_normal((1, tokens, n)).astype(np.float32) for n in (1024, 2048))
+        if tokens == 1:
+          names = [u.src[0].src[0].arg.name for u in Tensor.schedule_linear(residual_add(Tensor(x).realize(), lin(Tensor(h).realize()))).src
+                   if u.src[0].op is Ops.PROGRAM]
+          self.assertEqual(len(names), 2, names)
+          self.assertTrue(names[1].endswith("_res"), names)
+        ref = x + h @ w.T
+        np.testing.assert_allclose(residual_add(Tensor(x), lin(Tensor(h))).numpy(), ref, atol=0.02 * np.abs(ref).max(), rtol=0)
+    np.testing.assert_allclose(residual_add(Tensor.ones(2, 3), Tensor.ones(2, 3)).numpy(), np.full((2, 3), 2.0))
 
   def test_mmq_prefill(self):
     # prefill (>= 128 tokens) on the int8 GEMM: activations int8 per 32 values, weights requantized exactly; mixed formats in one

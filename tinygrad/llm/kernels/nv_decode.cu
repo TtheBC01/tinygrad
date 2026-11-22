@@ -4,7 +4,9 @@
 // LPK = HD/8 lanes, 8 head dims (one 16-byte load) per lane, so a warp holds 32/LPK keys per step and UNR steps' loads are issued
 // before any is used: enough bytes in flight to stream the cache (one key per warp at a time was latency bound, ~300 GB/s).
 // The G = NH/NKV query heads of a KV head share each K/V row read (GQA).
-// nv.py prepends nv_common.cuh and nv_decode_merge.cuh and #defines PARTIAL or COMBINE, KNAME NB NH NKV NCTX HD NSPLIT NWARPS UNR MINKEYS.
+// NT query tokens per sequence (speculative decoding's check): token t sits at position valid_end - NT + t and sees the keys before
+// it and itself, each (sequence, token) its own row of splits. nv.py prepends nv_common.cuh and nv_decode_merge.cuh and #defines
+// PARTIAL or COMBINE, KNAME NB NT NH NKV NCTX HD NSPLIT NWARPS UNR MINKEYS.
 
 #define G (NH / NKV)
 #define LPK (HD / 8)             // lanes per key
@@ -22,17 +24,17 @@ __device__ __forceinline__ void load8(float (&f)[8], const half *p) {  // 8 cons
 
 #ifdef PARTIAL
 static_assert(sizeof(float) * NWARPS * G * (HD + 2) <= 48 * 1024, "too many query heads per KV head for shared memory");
-// grid (NSPLIT, NB * NKV), NWARPS * 32 threads. P: [NB][NH][NSPLIT][PSTRIDE] fp32 (only the non-empty splits are written).
-// Q: [NB][NH][HD] fp16. params[0] = valid_end.
+// grid (NSPLIT, NB * NT * NKV), NWARPS * 32 threads. P: [NB * NT][NH][NSPLIT][PSTRIDE] fp32 (only the non-empty splits are written).
+// Q: [NB * NT][NH][HD] fp16. params[0] = valid_end.
 extern "C" __global__ void __launch_bounds__(32 * NWARPS)
 KNAME(float *__restrict__ P, const half *__restrict__ Q, const half *__restrict__ KV, const int *__restrict__ params) {
   __shared__ float sm_m[NWARPS][G], sm_l[NWARPS][G], sm_o[NWARPS][G][HD];
-  const int split = blockIdx.x, b = blockIdx.y / NKV, kvh = blockIdx.y % NKV, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int split = blockIdx.x, bt = blockIdx.y / NKV, b = bt / NT, kvh = blockIdx.y % NKV, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int sub = lane / LPK, dl = lane % LPK;  // which of the warp's keys, which 8 dims
-  const int valid_end = params[0];
+  const int valid_end = params[0] - NT + 1 + bt % NT;  // this token's keys
   float q[G][8], o[G][8], m[G], l[G];
 #pragma unroll
-  for (int g = 0; g < G; g++) load8(q[g], Q + ((size_t)b * NH + kvh * G + g) * HD + dl * 8);  // in flight with params
+  for (int g = 0; g < G; g++) load8(q[g], Q + ((size_t)bt * NH + kvh * G + g) * HD + dl * 8);  // in flight with params
   const int per = decode_split_keys(valid_end, NSPLIT, MINKEYS), k0 = split * per, k1 = min(valid_end, k0 + per);
   if (k0 >= k1) return;  // an empty split: the merge reads only the splits that have keys
   const float scale = 1.4426950408889634f * rsqrtf((float)HD);  // log2(e)/sqrt(HD): softmax via exp2
@@ -116,7 +118,7 @@ KNAME(float *__restrict__ P, const half *__restrict__ Q, const half *__restrict_
       const float s = exp2f(sm_m[w][g] - M);  // 0 for a warp that had no keys
       L += sm_l[w][g] * s, Od += sm_o[w][g][d] * s;
     }
-    float *pp = P + (((size_t)b * NH + kvh * G + g) * NSPLIT + split) * PSTRIDE;
+    float *pp = P + (((size_t)bt * NH + kvh * G + g) * NSPLIT + split) * PSTRIDE;
     pp[d] = Od;
     if (d == 0) pp[HD] = M, pp[HD + 1] = L;
   }
@@ -124,9 +126,9 @@ KNAME(float *__restrict__ P, const half *__restrict__ Q, const half *__restrict_
 #endif
 
 #ifdef COMBINE
-// grid (NB * NH), HD threads: warp w merges head dims w*32 .. w*32+31. O: [NB][NH][HD] fp32 (one token). params[0] = valid_end.
+// grid (NB * NT * NH), HD threads: warp w merges head dims w*32 .. w*32+31. O: [NB * NT][NH][HD] fp32. params[0] = valid_end.
 extern "C" __global__ void __launch_bounds__(HD) KNAME(float *__restrict__ O, const float *__restrict__ P, const int *__restrict__ params) {
-  const int ns = decode_active_splits(params[0], NSPLIT, MINKEYS), d = threadIdx.x;
+  const int ns = decode_active_splits(params[0] - NT + 1 + (int)(blockIdx.x / NH) % NT, NSPLIT, MINKEYS), d = threadIdx.x;
   O[(size_t)blockIdx.x * HD + d] = decode_merge<NSPLIT>(P + (size_t)blockIdx.x * NSPLIT * PSTRIDE, ns, HD, d & 31, d);
 }
 #endif
