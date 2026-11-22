@@ -79,7 +79,7 @@ def main():
                       metavar="[PREFILL,]DECODE", help="Benchmark tok/s (PREFILL prompt tokens then DECODE new tokens, default 0,20)")
   parser.add_argument("--no_chat_template", action="store_true", help="Don't use the model's chat template, always use the fallback template")
   parser.add_argument("--shard", type=int, default=1, help="Tensor parallel device count")
-  parser.add_argument("--draft", help="Draft model for speculative decoding (same tokenizer, e.g. llama3.2:1b-q4 for llama3.1:8b); greedy only")
+  parser.add_argument("--draft", help="Draft model for speculative decoding (same tokenizer, e.g. llama3.2:1b-q4 for llama3.1:8b)")
   parser.add_argument("--draft_k", type=int, default=5, help="Tokens the draft model proposes per round")
   args = parser.parse_args()
   if args.benchmark: args.max_context = max(args.max_context, round_up(sum(args.benchmark)+1, 1024))
@@ -100,7 +100,7 @@ def main():
     model.draft = (Transformer.from_hf if dpath.is_dir() else Transformer.from_gguf)(dpath, args.max_context, shard=args.shard)[0]
     model.draft_k = args.draft_k
     if model.draft.config.vocab_size != model.config.vocab_size: raise SystemExit("--draft: the draft model has a different vocabulary")
-    print(f"speculative decoding with draft {args.draft}, {args.draft_k} tokens per round (temperature 0)")
+    print(f"speculative decoding with draft {args.draft}, {args.draft_k} tokens per round")
 
   # get tokenizer
   tok = SimpleTokenizer.from_hf(path, preset='glm4') if path.is_dir() else SimpleTokenizer.from_gguf_kv(kv)

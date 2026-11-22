@@ -108,6 +108,22 @@ def permute_rope(w:Tensor, n_heads:int, rope_dim:int) -> Tensor:
   prefix = x.shape[1]-rope_dim
   return x[:, :prefix].cat(x[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(w.shape)
 
+def gumbel_sample(logits:Tensor) -> Tensor:
+  # Gumbel-max trick: argmax(logits - log(-log(uniform))) is a sample from softmax(logits)
+  return (logits - Tensor.rand_like(logits).maximum(1e-12).log().neg().log()).argmax(-1)
+
+def spec_accept(p:Tensor, q:Tensor, props:Tensor) -> tuple[Tensor, Tensor]:
+  # speculative sampling (Leviathan et al. 2023): p (B, k, V) the target's distributions at the k drafted positions, q (B, k, V) the
+  # draft's, props (B, k) the drafted tokens (sampled from q). Drafted token i is kept with probability min(1, p_i/q_i) while every
+  # one before it is; the first rejected one is replaced by a sample from max(0, p_i - q_i), so each kept token is distributed as p.
+  # Returns the output tokens (B, k), the kept drafted tokens then the replacement, and n (B, 1) the number of kept drafted tokens.
+  idx = props.unsqueeze(-1)
+  px, qx = p.gather(-1, idx).squeeze(-1), q.gather(-1, idx).squeeze(-1)
+  n = (Tensor.rand_like(px) * qx < px).cast(dtypes.int32).cumprod(1).sum(1, keepdim=True)
+  r = (p - q).maximum(0)
+  r = (r.sum(-1, keepdim=True) > 0).where(r, p)  # p == q (to rounding) rejects with probability ~0: fall back to p
+  return (Tensor.arange(props.shape[1]).unsqueeze(0) < n).where(props, gumbel_sample(r.log()).cast(props.dtype)), n
+
 def topk_mask(x:Tensor, k:int) -> Tensor: return x.zeros_like(dtype=dtypes.bool).scatter(-1, x.topk(k)[1], True)
 
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
@@ -820,7 +836,8 @@ class Transformer:
     self.prefill_jits:dict[tuple[int, bool], Any] = {}  # TinyJit per chunk size (the token count's max) and prompt-buffer input
     self.rollout_jit = TinyJit(self.forward)
     self.verify_jits:dict[int, Any] = {}  # TinyJit per token count
-    # speculative decoding: with a draft model set, greedy generate() runs generate_speculative with draft_k proposals per round
+    self._spec_state:dict[tuple[int, int, bool], Any] = {}  # generate_speculative's JITs and buffers per draft, k and sampling
+    # speculative decoding: with a draft model set, generate() runs generate_speculative with draft_k proposals per round
     self.draft:Transformer|None = None
     self.draft_k = 5
 
@@ -842,12 +859,13 @@ class Transformer:
     if (jit:=self.verify_jits.get(T:=int(tokens.shape[1]))) is None: jit = self.verify_jits[T] = TinyJit(self.forward_verify)
     return jit(tokens.contiguous(), start_pos)
 
+  def last_logits(self, tokens:Tensor, *start_pos:int|UOp) -> Tensor:
+    # only run the output projection on the last token: (B, T) -> (B, V)
+    return self.output(self.output_norm(self._trunk(tokens, start_pos)[:, -1:]))[:, -1, :].to(tokens.device)
+
   def forward(self, tokens:Tensor, temperature:Tensor, *start_pos:int|UOp) -> Tensor:
-    x = self._trunk(tokens, start_pos)
-    # only run the output projection on the last token
-    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
-    # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    # a sample from softmax(logits/temp) (the argmax at temperature 0)
+    return gumbel_sample(self.last_logits(tokens, *start_pos) / temperature.maximum(1e-12)).unsqueeze(-1)
 
   def __call__(self, tokens:Tensor, start_pos:StartPos, temperature:Tensor) -> Tensor:
     assert len(start_pos) in (1, tokens.shape[0]), "expected one shared position or one position per batch row"
@@ -1151,13 +1169,32 @@ class Transformer:
     n = (g[:, :k] == props).cast(dtypes.int32).cumprod(1).sum(1, keepdim=True)
     return g.cat((n + 1).minimum(k), dim=1)
 
-  def generate_speculative(self, draft:Transformer, tokens:list[int], k:int=4, chunk_size:int|None=None):
-    """Greedy generation (temperature 0) with speculative decoding: draft (a small model with the same tokenizer) proposes k tokens
-    one at a time, this model checks them in one forward over k+1 tokens and keeps the drafted tokens it agrees with plus its own
-    next token, so the output is this model's greedy output while its weights are read once per round. Each round stays on the GPU
+  def _spec_draft_sampled(self, src:Tensor, props:Tensor, qs:Tensor, temp:Tensor, j:UOp, i:UOp, pos:UOp) -> Tensor:
+    # sampled speculative decoding, the draft's step: also store its distribution softmax(logits/temp) in qs[:, i]
+    logits = self.last_logits(src[:, j:j+1].contiguous(), pos).float() / temp.maximum(1e-12)
+    out = gumbel_sample(logits).unsqueeze(-1)
+    qs[:, i:i+1].assign(logits.softmax(-1).unsqueeze(1)).realize()
+    props[:, i:i+1].assign(out.cast(props.dtype)).realize()
+    return out
+
+  def _spec_verify_sampled(self, src:Tensor, props:Tensor, qs:Tensor, temp:Tensor, j:UOp, pos:UOp) -> Tensor:
+    # the target's distributions after src[:, j] and the first k-1 drafted tokens (no bonus token, as in _spec_verify), then
+    # spec_accept's k tokens and m = how many to keep
+    k = int(props.shape[1])
+    toks = src[:, j:j+1] if k == 1 else src[:, j:j+1].cat(props[:, :k-1], dim=1)
+    logits = self.output(self.output_norm(self._trunk(toks, (pos,)))).float().to(src.device)
+    out, n = spec_accept((logits / temp.maximum(1e-12)).softmax(-1), qs, props)
+    return out.cast(dtypes.int32).cat((n + 1).minimum(k), dim=1)
+
+  def generate_speculative(self, draft:Transformer, tokens:list[int], k:int=4, chunk_size:int|None=None, temperature:float=0.0):
+    """Generation with speculative decoding: draft (a small model with the same tokenizer) proposes k tokens one at a time and this
+    model checks them in one forward, so its weights are read once per round. At temperature 0 it keeps the drafted tokens it agrees
+    with plus its own next token, so the output is this model's greedy output. Above 0 the draft samples and spec_accept keeps or
+    replaces its tokens so the output is distributed as this model's samples at that temperature. Each round stays on the GPU
     (the draft's steps and the check are JITs that pass tokens through device buffers); one readback per round."""
     assert self.max_context <= draft.max_context and not self.has_recurrent_block and not draft.has_recurrent_block and k >= 1
-    temp = self._temperature(0.0)
+    assert self.config.vocab_size == draft.config.vocab_size, "the draft model needs the same vocabulary"
+    temp, sampled = self._temperature(temperature), temperature > 0
     v_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_j, v_i = UOp.variable("spec_j", 0, k), UOp.variable("spec_i", 0, k-1)
     def prefill(m:Transformer, toks:list[int], start:int) -> int:  # process toks[start:], return the next token
@@ -1172,18 +1209,18 @@ class Transformer:
     tokens.append(prefill(self, tokens, start))
     prefill(draft, tokens[:-1], start)
     yield tokens[-1]
-    key = (id(draft), k)
-    if getattr(self, "_spec_key", None) != key:  # JITs for this draft and k
-      self._spec_key = key
-      self._spec_jits = (TinyJit(draft._spec_draft), TinyJit(draft._spec_draft), TinyJit(self._spec_verify))
-      self._spec_props = Tensor.zeros(1, k, dtype=dtypes.int32).contiguous().realize()
-    first, nxt, verify = self._spec_jits
-    props = self._spec_props
-    gb, j, pos = Tensor([[tokens[-1]] + [0] * (k + 1)], dtype="int32").realize(), 0, len(tokens) - 1
+    if (st:=self._spec_state.get(key:=(id(draft), k, sampled))) is None:  # JITs and buffers for this draft, k and greedy or sampled
+      step, check = (draft._spec_draft_sampled, self._spec_verify_sampled) if sampled else (draft._spec_draft, self._spec_verify)
+      st = self._spec_state[key] = ((TinyJit(step), TinyJit(step), TinyJit(check)), Tensor.zeros(1, k, dtype=dtypes.int32).contiguous().realize(),
+                                    Tensor.zeros(1, k, self.config.vocab_size).contiguous().realize() if sampled else None)
+    (first, nxt, verify), props, qs = st
+    # the inputs after the tokens: the draft's step (props, [qs,] temp), the check (props[, qs, temp])
+    dargs, vargs = ((props, qs, temp), (props, qs, temp)) if sampled else ((props, temp), (props,))
+    gb, j, pos = Tensor([[tokens[-1]] + [0] * (k if sampled else k + 1)], dtype="int32").realize(), 0, len(tokens) - 1
     while pos + k + 1 <= self.max_context:
-      out = first(gb, props, temp, v_j.bind(j), v_i.bind(0), v_pos.bind(pos))
-      for i in range(1, k): out = nxt(out, props, temp, v_j.bind(0), v_i.bind(i), v_pos.bind(pos + i))
-      gb = verify(gb, props, v_j.bind(j), v_pos.bind(pos))
+      out = first(gb, *dargs, v_j.bind(j), v_i.bind(0), v_pos.bind(pos))
+      for i in range(1, k): out = nxt(out, *dargs, v_j.bind(0), v_i.bind(i), v_pos.bind(pos + i))
+      gb = verify(gb, *vargs, v_j.bind(j), v_pos.bind(pos))
       vals = [int(v) for v in cast(list, gb.tolist())[0]]
       m = vals[-1]
       self._cached_tokens = draft._cached_tokens = tokens + vals[:m - 1]
@@ -1194,8 +1231,8 @@ class Transformer:
 
   def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0):
     # chunk_size: one fixed prefill chunk size instead of PREFILL_CHUNKS
-    if self.draft is not None and temperature == 0.0:
-      yield from self.generate_speculative(self.draft, tokens, self.draft_k, chunk_size)
+    if self.draft is not None:
+      yield from self.generate_speculative(self.draft, tokens, self.draft_k, chunk_size, temperature)
       return
     tiers = self._prefill_tiers(chunk_size)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
