@@ -1,13 +1,35 @@
 from __future__ import annotations
-import enum, functools, itertools, json, math, pathlib, re
+import array, enum, functools, itertools, json, math, pathlib, re
 from dataclasses import dataclass, replace
-from typing import Callable
+from typing import Any, Callable, cast
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
+from tinygrad.engine.jit import ScratchPool
+from tinygrad.device import Buffer, BufferSpec
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import RMSNorm, fused_linear, glu_ffn, residual_add
+from tinygrad.llm.kernels.nv import nv_flash_attention
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
 from tinygrad.helpers import unwrap, round_up, ceildiv, get_child
+
+# generate()'s prefill chunk sizes. A symbolic chunk runs padded to its size and each size has its own prefill JIT; state sized by
+# the chunk is sized for the largest. The largest size runs while that much is left, the rest takes the cheapest split with each
+# chunk costing PREFILL_CHUNK_COST + its size (in tokens: per-chunk work that doesn't scale with the tokens, ~70 on 8B NV).
+# Each JIT has its own scratch buffers (~0.1 GB per size on 8B Q4_K_M), PREFILL_CHUNKS=32,512 trades speed for less of it.
+PREFILL_CHUNKS = tuple(sorted(int(c) for c in getenv("PREFILL_CHUNKS", "32,64,128,256,512").split(",")))
+PREFILL_CHUNK_COST = 64
+@functools.cache
+def _chunk_plan(sizes:tuple[int, ...], left:int) -> tuple[int, int]:  # (cost, first chunk) of the cheapest split of left tokens
+  return (0, 0) if left <= 0 else min((PREFILL_CHUNK_COST + c + _chunk_plan(sizes, left - c)[0], c) for c in sizes)
+def _write_host(t:Tensor, vals:list, fmt:str) -> Tensor:
+  # host values into the start of a realized buffer with a plain copy: an eager realize would walk every live Tensor (~10 ms on 8B)
+  if vals:
+    mv = memoryview(array.array(fmt, vals)).cast("B")
+    cast(Buffer, t.uop.base.realized).view(mv.nbytes, 0).ensure_allocated().copy_from(Buffer("NPY", mv.nbytes, opaque=mv).ensure_allocated())
+  return t
+
+def chunk_room(x:Tensor) -> int: return max(int(x.max_shape[1]), PREFILL_CHUNKS[-1])
 
 StartPos = tuple[int|UOp, ...]
 
@@ -58,9 +80,13 @@ def apply_rope(x:Tensor, freqs_cis:Tensor, interleaved:bool=False, last:bool=Fal
   x = (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
   return x.rearrange("b h t (two d) -> b h t (d two)", two=2) if interleaved else x
 
-def _update_cache(cache:Tensor, value:Tensor, start_pos:StartPos, dim:int) -> Tensor:
+def _update_cache(cache:Tensor, value:Tensor, start_pos:StartPos, dim:int, rows:tuple[int|UOp, ...]|None=None) -> Tensor:
+  # rows: value's sequence b goes into row rows[b] of a batched cache (dim 0 is the batch)
   def store(c:Tensor, v:Tensor, pos:int|UOp) -> UOp:
     return c.shrink(tuple((pos, pos+v.shape[dim]) if i == dim else None for i in range(c.ndim))).uop.store(v.cast(c.dtype).uop)
+  if rows is not None:
+    assert len(rows) == value.shape[0] and len(start_pos) in (1, len(rows)), "a row per sequence"
+    return Tensor(cache.uop.after(*[store(cache[r:r+1], value[b:b+1], start_pos[b if len(start_pos) > 1 else 0]) for b, r in enumerate(rows)]))
   stores = ([store(cache, value, start_pos[0])] if len(start_pos) == 1 else [store(cache[b:b+1], value[b:b+1], p) for b, p in enumerate(start_pos)])
   return Tensor(cache.uop.after(*stores))
 
@@ -86,6 +112,22 @@ def permute_rope(w:Tensor, n_heads:int, rope_dim:int) -> Tensor:
   x = w.reshape(n_heads, w.shape[0]//n_heads, -1)
   prefix = x.shape[1]-rope_dim
   return x[:, :prefix].cat(x[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(w.shape)
+
+def gumbel_sample(logits:Tensor) -> Tensor:
+  # Gumbel-max trick: argmax(logits - log(-log(uniform))) is a sample from softmax(logits)
+  return (logits - Tensor.rand_like(logits).maximum(1e-12).log().neg().log()).argmax(-1)
+
+def spec_accept(p:Tensor, q:Tensor, props:Tensor) -> tuple[Tensor, Tensor]:
+  # speculative sampling (Leviathan et al. 2023): p (B, k, V) the target's distributions at the k drafted positions, q (B, k, V) the
+  # draft's, props (B, k) the drafted tokens (sampled from q). Drafted token i is kept with probability min(1, p_i/q_i) while every
+  # one before it is; the first rejected one is replaced by a sample from max(0, p_i - q_i), so each kept token is distributed as p.
+  # Returns the output tokens (B, k), the kept drafted tokens then the replacement, and n (B, 1) the number of kept drafted tokens.
+  idx = props.unsqueeze(-1)
+  px, qx = p.gather(-1, idx).squeeze(-1), q.gather(-1, idx).squeeze(-1)
+  n = (Tensor.rand_like(px) * qx < px).cast(dtypes.int32).cumprod(1).sum(1, keepdim=True)
+  r = (p - q).maximum(0)
+  r = (r.sum(-1, keepdim=True) > 0).where(r, p)  # p == q (to rounding) rejects with probability ~0: fall back to p
+  return (Tensor.arange(props.shape[1]).unsqueeze(0) < n).where(props, gumbel_sample(r.log()).cast(props.dtype)), n
 
 def topk_mask(x:Tensor, k:int) -> Tensor: return x.zeros_like(dtype=dtypes.bool).scatter(-1, x.topk(k)[1], True)
 
@@ -269,8 +311,8 @@ class FFNBlock:
     self.config = config
 
     # --- RMSNorms --------------------------------------------------------
-    self.attn_norm: Callable[[Tensor], Tensor] = nn.RMSNorm(config.dim, config.norm_eps)
-    self.ffn_norm:  Callable[[Tensor], Tensor] = nn.RMSNorm(config.dim, config.norm_eps)
+    self.attn_norm: Callable[[Tensor], Tensor] = RMSNorm(config.dim, config.norm_eps)
+    self.ffn_norm:  Callable[[Tensor], Tensor] = RMSNorm(config.dim, config.norm_eps)
     if config.hc is not None:
       hc = GatedResidual if config.hc.low_rank else HyperConnection
       self.hc_attn, self.hc_ffn = hc(config), hc(config)
@@ -338,7 +380,11 @@ class FFNBlock:
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
-    return self.ffn_down(gated_activation(self.ffn_gate(x), self.ffn_up(x), self.config))
+    # NV/CUDA on GGUF quant weights: gate and up in one kernel, and in decode the activation folded into ffn_down's input
+    c = self.config
+    limit = c.swiglu_limit if c.swiglu_limit is not None and c.swiglu_limit > 0 else None
+    glu = None if c.situ is not None else (c.swiglu_alpha, limit, c.swiglu_up_bias)
+    return glu_ffn(x, self.ffn_gate, self.ffn_up, self.ffn_down, functools.partial(gated_activation, config=c), glu)
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
@@ -348,24 +394,25 @@ class FFNBlock:
     # a full indexer layer selects the top-k tokens for itself and the shared layers after it (MLATransformerBlock)
     return idx_mask
 
-  def __call__(self, x: Tensor, start_pos: StartPos, idx_mask: Tensor|None=None, tokens: Tensor|None=None):
+  def __call__(self, x: Tensor, start_pos: StartPos, idx_mask: Tensor|None=None, tokens: Tensor|None=None, rows:tuple[int|UOp, ...]|None=None):
+    # rows: x's sequence b is in row rows[b] of batched KV caches (DecodeBatch; TransformerBlock only)
     self._init_state(x)
     if hasattr(self, 'ple'): self.ple._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
-    def _run(x:Tensor, start_pos:StartPos, idx_mask:Tensor|None, tokens:Tensor|None):
+    def _run(x:Tensor, start_pos:StartPos, idx_mask:Tensor|None, tokens:Tensor|None, rows:tuple[int|UOp, ...]|None):
       if hasattr(self, 'ple'): x = x + self.ple(x, start_pos)  # (B, T, hc, D)
       def attend(h:Tensor) -> tuple[Tensor, Tensor|None]:
         h = self.attn_norm(h)
         mask = self._indexer_mask(h, start_pos, idx_mask)
-        return self._attention(h, start_pos, mask), mask
-      res_attn = res_ffn = lambda xs, sublayer: (xs + (ret:=sublayer(xs))[0], ret[1])
+        return self._attention(h, start_pos, mask, **({} if rows is None else {"rows": rows})), mask
+      res_attn = res_ffn = lambda xs, sublayer: (residual_add(xs, (ret:=sublayer(xs))[0]), ret[1])
       if self.config.hc is not None: res_attn, res_ffn = self.hc_attn, self.hc_ffn
       elif self.config.attn_res_block_size: res_attn, res_ffn = self.attn_res_score, self.ffn_res_score
       x, idx_mask = res_attn(x, attend)
       out = res_ffn(x, lambda h: (self._feed_forward(self.ffn_norm(h), tokens), None))[0].contiguous()
       return (out, idx_mask) if idx_mask is not None else out
-    out = _run(x, start_pos, idx_mask, tokens)
+    out = _run(x, start_pos, idx_mask, tokens, rows)
     return out if isinstance(out, tuple) else (out, None)
 
 class TransformerBlock(FFNBlock):
@@ -384,8 +431,8 @@ class TransformerBlock(FFNBlock):
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
     self.indexer = Indexer(config) if config.indexer else None
 
-  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None) -> Tensor:
-    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None, rows:tuple[int|UOp, ...]|None=None) -> Tensor:
+    q, k, v = fused_linear(x, self.attn_q, self.attn_k, self.attn_v)  # one kernel on NV/CUDA for GGUF quant weights
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
@@ -402,12 +449,19 @@ class TransformerBlock(FFNBlock):
     k = apply_rope(k[..., :self.config.rope_dim], freqs).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
-    assigned_kv = _update_cache(self.cache_kv.transpose(0, 1), Tensor.stack(k, v).transpose(0, 1), start_pos, 3)
+    assigned_kv = _update_cache(self.cache_kv.transpose(0, 1), Tensor.stack(k, v).transpose(0, 1), start_pos, 3, rows)
     # on RDNA3/4, hybrid models use custom flash attention kernels on the KV cache
-    if  idx_mask is None and amd_custom_kernels_supported(x.device) and self.config.ssm is not None and len(start_pos) == 1:
+    if  idx_mask is None and amd_custom_kernels_supported(x.device) and self.config.ssm is not None and len(start_pos) == 1 and rows is None:
       attn = flash_attention(q, assigned_kv.transpose(0, 1), start_pos[0]+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
+    # on NV/CUDA (sm_80+), flash attention on the KV cache (flash decoding for one token), (B,T,H*Hd); None when it doesn't apply.
+    # Rows with their own positions (batched decode) take flash decoding with a length per row.
+    if idx_mask is None and not hasattr(self, 'attn_sinks') and not self.config.sliding_window and \
+       (nv_attn:=nv_flash_attention(q, assigned_kv.transpose(0, 1), start_pos[0]+T if len(start_pos) == 1 else tuple(p+T for p in start_pos),
+                                    rows)) is not None:
+      return self.attn_output(nv_attn if not self.config.attn_output_gate else (nv_attn * gate.sigmoid()))
+    if rows is not None: assigned_kv = Tensor.cat(*(assigned_kv[r:r+1] for r in rows))
     assigned_kv = _cache_prefix(assigned_kv, start_pos, T, 3).transpose(0, 1)
     k, v = assigned_kv[0], assigned_kv[1]
     mask = (idx_mask.repeat_interleave(self.config.n_heads // int(idx_mask.shape[1]), dim=1) if idx_mask is not None else
@@ -428,12 +482,13 @@ class TransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
-      # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0)
-      self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
-                                   dtype=dtypes.half, device=x.device if isinstance(x.device, str) else None)
+      # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0). cache_rows: a
+      # DecodeBatch's slots, else x's batch
+      self.cache_kv = Tensor.zeros(2, getattr(self, "cache_rows", None) or x.shape[0], self.config.n_kv_heads, self.config.max_context,
+                                   self.config.head_dim, dtype=dtypes.half, device=x.device if isinstance(x.device, str) else None)
       if isinstance(x.device, tuple): self.cache_kv = self.cache_kv.shard(x.device, 2).realize()
       # start_pos and T have independent symbolic bounds, the slice can overrun the context by all but one of T
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context + x.max_shape[1]-1, self.config.rope_theta,
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context + chunk_room(x)-1, self.config.rope_theta,
                                             device=x.device, yarn=self.config.yarn)
     if self.indexer: self.indexer._init_state(x)
 
@@ -533,7 +588,7 @@ class Compressor:
     if not hasattr(self, "cache_pools"):
       self.cache_kg = Tensor.empty(x.shape[0], self.ratio * self.span, 2, self.dim * self.span, device=x.device)
       # zeroed: a NaN in the masked incomplete pools would still poison the attention
-      self.cache_pools = Tensor.zeros(x.shape[0], ceildiv(self.max_context + x.max_shape[1], self.ratio) + 2, self.dim,
+      self.cache_pools = Tensor.zeros(x.shape[0], ceildiv(self.max_context + chunk_room(x), self.ratio) + 2, self.dim,
                                       dtype=dtypes.half, device=x.device).clone()
 
   def __call__(self, x:Tensor, start_pos:StartPos, freqs:Tensor) -> Tensor:
@@ -658,7 +713,7 @@ class CompressedAttentionBlock(FFNBlock):
     if not hasattr(self, "cache_kv"):
       R, (theta, yarn) = max((cfg:=self.config).compress_ratios), (cfg.compress_rope_theta, cfg.yarn) if self.ratio else (cfg.rope_theta, None)
       self.cache_kv = Tensor.empty(x.shape[0], cfg.sliding_window, cfg.head_dim, dtype=dtypes.half, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(cfg.rope_dim, round_up(cfg.max_context + x.max_shape[1], R) + 2*R, theta, device=x.device, yarn=yarn)
+      self.freqs_cis = precompute_freqs_cis(cfg.rope_dim, round_up(cfg.max_context + chunk_room(x), R) + 2*R, theta, device=x.device, yarn=yarn)
     if self.ratio: self.attn_compressor._init_state(x)
     if self.indexer: self.indexer._init_state(x)
 
@@ -778,7 +833,7 @@ class Transformer:
       if config.compress_ratios: self.blk.append(CompressedAttentionBlock(c, config.compress_ratios[i]))
       else: self.blk.append(GatedDeltaNetBlock(c, config.ssm) if config.ssm and config.ssm_layers[i] else block_cls(c))
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
-    self.output_norm: Callable[[Tensor], Tensor] = nn.RMSNorm(config.dim, config.norm_eps)
+    self.output_norm: Callable[[Tensor], Tensor] = RMSNorm(config.dim, config.norm_eps)
     if config.hc and config.hc.head: self.output_hc = HyperConnection(config, head=True)
     if config.hc and config.hc.low_rank: self.output_hc, self.output_norm = GatedResidual(config, inject=False), lambda x: x
     if config.attn_res_block_size: self.output_res_score = AttentionResidual(config)
@@ -787,29 +842,59 @@ class Transformer:
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     self._position_count: int|None = None
-    # we specialize the JIT for prefill and rollout
-    self.prefill_jit = TinyJit(self.forward)
-    self.rollout_jit = TinyJit(self.forward)
+    # we specialize the JIT for prefill and rollout, and speculative decoding's verification (a static token count)
+    self.prefill_jits:dict[tuple[int, bool], Any] = {}  # TinyJit per chunk size (the token count's max) and prompt-buffer input
+    # all of the model's JITs run one at a time: they share one scratch arena (the largest one's) instead of one each
+    self.scratch = ScratchPool()
+    self.rollout_jit = TinyJit(self.forward, scratch=self.scratch)
+    self.verify_jits:dict[int, Any] = {}  # TinyJit per token count
+    self._spec_state:dict[tuple[int, int, bool], Any] = {}  # generate_speculative's JITs and buffers per draft, k and sampling
+    # speculative decoding: with a draft model set, generate() runs generate_speculative with draft_k proposals per round
+    self.draft:Transformer|None = None
+    self.draft_k = 5
 
-  def forward(self, tokens:Tensor, temperature:Tensor, *start_pos:int|UOp) -> Tensor:
+  def _trunk(self, tokens:Tensor, start_pos:tuple[int|UOp, ...], rows:tuple[int|UOp, ...]|None=None) -> Tensor:
     x = self.token_embd(t:=tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     elif self.config.attn_res_block_size: x = x.unsqueeze(2)
     idx_mask = None
-    for block in self.blk: x, idx_mask = block(x, start_pos, idx_mask, t)
+    for block in self.blk: x, idx_mask = block(x, start_pos, idx_mask, t, rows)
     if hc is not None: x = self.output_hc.mix(x)[0] if hasattr(self, 'output_hc') else x.mean(2)
     elif self.config.attn_res_block_size: x = self.output_res_score.mix(x)
-    # only run the output projection on the last token
-    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
-    # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    return x
+
+  def forward_verify(self, tokens:Tensor, *start_pos:int|UOp) -> Tensor:
+    # the greedy next token after every position of tokens (B, T) -> (B, T): checks a draft's tokens in one pass
+    return self.output(self.output_norm(self._trunk(tokens, start_pos))).argmax(-1).to(tokens.device)
+
+  def verify(self, tokens:Tensor, start_pos:UOp) -> Tensor:
+    if (jit:=self.verify_jits.get(T:=int(tokens.shape[1]))) is None: jit = self.verify_jits[T] = TinyJit(self.forward_verify, scratch=self.scratch)
+    return jit(tokens.contiguous(), start_pos)
+
+  def last_logits(self, tokens:Tensor, *start_pos:int|UOp, rows:tuple[int|UOp, ...]|None=None) -> Tensor:
+    # only run the output projection on the last token: (B, T) -> (B, V)
+    return self.output(self.output_norm(self._trunk(tokens, start_pos, rows)[:, -1:]))[:, -1, :].to(tokens.device)
+
+  def forward(self, tokens:Tensor, temperature:Tensor, *start_pos:int|UOp) -> Tensor:
+    # a sample from softmax(logits/temp) (the argmax at temperature 0); temperature (1,) or one per row (B, 1)
+    return gumbel_sample(self.last_logits(tokens, *start_pos) / temperature.maximum(1e-12)).unsqueeze(-1)
+
+  def forward_rows(self, tokens:Tensor, temperature:Tensor, rows:tuple[UOp, ...], *start_pos:UOp) -> Tensor:
+    # forward for sequences (B, T) in rows of batched KV caches, one position each or one for all (DecodeBatch)
+    return gumbel_sample(self.last_logits(tokens, *start_pos, rows=rows) / temperature.maximum(1e-12)).unsqueeze(-1)
 
   def __call__(self, tokens:Tensor, start_pos:StartPos, temperature:Tensor) -> Tensor:
     assert len(start_pos) in (1, tokens.shape[0]), "expected one shared position or one position per batch row"
     if self._position_count is None: self._position_count = len(start_pos)
     assert len(start_pos) == self._position_count, "position count is fixed for this model"
     positions = tuple(UOp.variable(f"start_pos_{b}", 0, self.max_context-1).bind(p) if isinstance(p, int) else p for b, p in enumerate(start_pos))
-    return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), temperature, *positions)
+    # a chunk of generate()'s prompt buffer goes in as a view (contiguous() would realize a copy eagerly), in its own JIT
+    view = (pb:=getattr(self, "_prompt_buf", None)) is not None and tokens.uop.base is pb.uop.base
+    if resolve(tokens.shape[1] != 1):
+      if (jit:=self.prefill_jits.get(key:=(int(tokens.max_shape[1]), view))) is None:
+        jit = self.prefill_jits[key] = TinyJit(self.forward, scratch=self.scratch)
+    else: jit = self.rollout_jit
+    return jit(tokens if view else tokens.contiguous(), temperature, *positions)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -901,12 +986,15 @@ class Transformer:
                       beta_slow=kv.get(f'{arch}.rope.scaling.yarn_beta_slow', 1.0)) if kv.get(f'{arch}.rope.scaling.type') == 'yarn' else None
 
     # Permute RoPE weights from interleaved to half-split layout.
+    rope_sources:dict[str, tuple[Tensor, int, int]] = {}  # the unpermuted weights: quantized kernels read them and permute their output
     for name in state_dict:
       if kda or '.indexer.' in name: continue
       if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
+        rope_sources[name] = (state_dict[name], n_heads, rope_dim)
         state_dict[name] = permute_rope(state_dict[name], n_heads, rope_dim)
       elif arch == 'llama' and 'attn_k.weight' in name:
-        state_dict[name] = permute_rope(state_dict[name], n_kv_heads, state_dict[name].shape[0]//n_kv_heads)
+        rope_sources[name] = (state_dict[name], n_kv_heads, state_dict[name].shape[0]//n_kv_heads)
+        state_dict[name] = permute_rope(*rope_sources[name])
       elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
         state_dict[name] = permute_rope(state_dict[name], 1, state_dict[name].shape[0]-kv_lora_rank)
     swiglu_oai = arch in ('gpt-oss', 'minimax-m3')
@@ -954,6 +1042,10 @@ class Transformer:
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    for name, src in rope_sources.items():
+      mod:Any = model
+      for part in name.split('.')[:-1]: mod = mod[int(part)] if part.isdigit() else getattr(mod, part, None)
+      if isinstance(mod, Linear): mod.rope_source = src
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -1042,6 +1134,35 @@ class Transformer:
 
   def warmup(self):
     for _ in range(2): list(zip(range(2), self.generate([0])))
+    # the larger prefill chunk sizes have their own JITs: capture each on a prompt that runs it once
+    for c in list(self._prefill_tiers(None))[1:]:
+      for _ in range(2):
+        self._cached_tokens = []
+        list(zip(range(1), self.generate([0] * c)))
+    self._cached_tokens = []
+
+  def _prompt(self, tokens:list[int]) -> Tensor:
+    # the prompt's ids in a persistent (1, max_context) buffer: generate() slices its chunks from it as JIT inputs
+    if (t:=getattr(self, "_prompt_buf", None)) is None:
+      t = self._prompt_buf = Tensor.zeros(1, self.max_context, dtype=dtypes.int32).contiguous().realize()
+    return _write_host(t, tokens[:self.max_context], "i")
+
+  def _temperature(self, temperature:float) -> Tensor:
+    if (t:=getattr(self, "_temp_buf", None)) is None: t = self._temp_buf = Tensor.zeros(1).contiguous().realize()
+    if getattr(self, "_temp_val", None) != temperature:
+      _write_host(t, [temperature], "f")
+      self._temp_val = temperature
+    return t
+
+  def _prefill_tiers(self, chunk_size:int|None) -> dict[int, UOp]:
+    # chunk size -> its symbolic token count (see PREFILL_CHUNKS); a given chunk_size is the only one
+    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): sizes:tuple[int, ...] = (1,)
+    elif chunk_size is not None: sizes = (chunk_size,)
+    else: sizes = tuple(c for c in PREFILL_CHUNKS if c == PREFILL_CHUNKS[0] or c < self.max_context)
+    return {c: UOp.variable("toks", 1, c) for c in sizes}
+
+  @staticmethod
+  def _chunk(sizes, left:int) -> int: return max(sizes) if left >= max(sizes) else _chunk_plan(tuple(sorted(sizes)), left)[1]
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -1051,21 +1172,99 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
-    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+  def _spec_draft(self, src:Tensor, props:Tensor, temp:Tensor, j:UOp, i:UOp, pos:UOp) -> Tensor:
+    # speculative decoding, the draft's step: decode token src[:, j] at pos and store the proposal in props[:, i]
+    out = self.forward(src[:, j:j+1].contiguous(), temp, pos)
+    props[:, i:i+1].assign(out.cast(props.dtype)).realize()
+    return out
+
+  def _spec_verify(self, src:Tensor, props:Tensor, j:UOp, pos:UOp) -> Tensor:
+    # the target's check of [src[:, j], props...] at pos: its greedy tokens g (k+1), then m = how many tokens to keep: the drafted
+    # tokens it agrees with plus its correction (or all k drafted ones; the draft hasn't seen the last, so no bonus token)
+    k = int(props.shape[1])
+    g = self.forward_verify(src[:, j:j+1].cat(props, dim=1), pos).cast(dtypes.int32)
+    n = (g[:, :k] == props).cast(dtypes.int32).cumprod(1).sum(1, keepdim=True)
+    return g.cat((n + 1).minimum(k), dim=1)
+
+  def _spec_draft_sampled(self, src:Tensor, props:Tensor, qs:Tensor, temp:Tensor, j:UOp, i:UOp, pos:UOp) -> Tensor:
+    # sampled speculative decoding, the draft's step: also store its distribution softmax(logits/temp) in qs[:, i]
+    logits = self.last_logits(src[:, j:j+1].contiguous(), pos).float() / temp.maximum(1e-12)
+    out = gumbel_sample(logits).unsqueeze(-1)
+    qs[:, i:i+1].assign(logits.softmax(-1).unsqueeze(1)).realize()
+    props[:, i:i+1].assign(out.cast(props.dtype)).realize()
+    return out
+
+  def _spec_verify_sampled(self, src:Tensor, props:Tensor, qs:Tensor, temp:Tensor, j:UOp, pos:UOp) -> Tensor:
+    # the target's distributions after src[:, j] and the first k-1 drafted tokens (no bonus token, as in _spec_verify), then
+    # spec_accept's k tokens and m = how many to keep
+    k = int(props.shape[1])
+    toks = src[:, j:j+1] if k == 1 else src[:, j:j+1].cat(props[:, :k-1], dim=1)
+    logits = self.output(self.output_norm(self._trunk(toks, (pos,)))).float().to(src.device)
+    out, n = spec_accept((logits / temp.maximum(1e-12)).softmax(-1), qs, props)
+    return out.cast(dtypes.int32).cat((n + 1).minimum(k), dim=1)
+
+  def generate_speculative(self, draft:Transformer, tokens:list[int], k:int=4, chunk_size:int|None=None, temperature:float=0.0):
+    """Generation with speculative decoding: draft (a small model with the same tokenizer) proposes k tokens one at a time and this
+    model checks them in one forward, so its weights are read once per round. At temperature 0 it keeps the drafted tokens it agrees
+    with plus its own next token, so the output is this model's greedy output. Above 0 the draft samples and spec_accept keeps or
+    replaces its tokens so the output is distributed as this model's samples at that temperature. Each round stays on the GPU
+    (the draft's steps and the check are JITs that pass tokens through device buffers); one readback per round."""
+    assert self.max_context <= draft.max_context and not self.has_recurrent_block and not draft.has_recurrent_block and k >= 1
+    assert self.config.vocab_size == draft.config.vocab_size, "the draft model needs the same vocabulary"
+    temp, sampled = self._temperature(temperature), temperature > 0
+    v_pos = UOp.variable("start_pos", 0, self.max_context-1)
+    v_j, v_i = UOp.variable("spec_j", 0, k), UOp.variable("spec_i", 0, k-1)
+    def prefill(m:Transformer, toks:list[int], start:int) -> int:  # process toks[start:], return the next token
+      t = m._prompt(toks)
+      out, tiers = None, m._prefill_tiers(chunk_size)
+      while start < len(toks):
+        n = min(c:=m._chunk(tiers, len(toks) - start), len(toks) - start)
+        out = m(t[:, v_pos.bind(start):v_pos.bind(start)+tiers[c].bind(n)], (v_pos.bind(start),), temp).realize()
+        start += n
+      return int(unwrap(out).item())
+    start = min(self.get_start_pos(tokens), draft.get_start_pos(tokens))
+    tokens.append(prefill(self, tokens, start))
+    prefill(draft, tokens[:-1], start)
+    yield tokens[-1]
+    if (st:=self._spec_state.get(key:=(id(draft), k, sampled))) is None:  # JITs and buffers for this draft, k and greedy or sampled
+      step, check = (draft._spec_draft_sampled, self._spec_verify_sampled) if sampled else (draft._spec_draft, self._spec_verify)
+      jits = (TinyJit(step, scratch=self.scratch), TinyJit(step, scratch=self.scratch), TinyJit(check, scratch=self.scratch))
+      st = self._spec_state[key] = (jits, Tensor.zeros(1, k, dtype=dtypes.int32).contiguous().realize(),
+                                    Tensor.zeros(1, k, self.config.vocab_size).contiguous().realize() if sampled else None)
+    (first, nxt, verify), props, qs = st
+    # the inputs after the tokens: the draft's step (props, [qs,] temp), the check (props[, qs, temp])
+    dargs, vargs = ((props, qs, temp), (props, qs, temp)) if sampled else ((props, temp), (props,))
+    gb, j, pos = Tensor([[tokens[-1]] + [0] * (k if sampled else k + 1)], dtype="int32").realize(), 0, len(tokens) - 1
+    while pos + k + 1 <= self.max_context:
+      out = first(gb, *dargs, v_j.bind(j), v_i.bind(0), v_pos.bind(pos))
+      for i in range(1, k): out = nxt(out, *dargs, v_j.bind(0), v_i.bind(i), v_pos.bind(pos + i))
+      gb = verify(gb, *vargs, v_j.bind(j), v_pos.bind(pos))
+      vals = [int(v) for v in cast(list, gb.tolist())[0]]
+      m = vals[-1]
+      self._cached_tokens = draft._cached_tokens = tokens + vals[:m - 1]
+      for tk in vals[:m]:
+        tokens.append(tk)
+        yield tk
+      j, pos = m - 1, pos + m
+
+  def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0):
+    # chunk_size: one fixed prefill chunk size instead of PREFILL_CHUNKS
+    if self.draft is not None:
+      yield from self.generate_speculative(self.draft, tokens, self.draft_k, chunk_size, temperature)
+      return
+    tiers = self._prefill_tiers(chunk_size)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
-    v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
-    temp = Tensor([temperature])
-    # assign all input tokens once, then slice from start_pos for the model call
-    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+    temp = self._temperature(temperature)
+    # write all input tokens once, then slice from start_pos for the model call
+    t = self._prompt(tokens)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
-      if self.config.ple: self.blk[self.config.ple.layer].ple.write_rows(tokens, start_pos, n_toks, chunk_size)
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+      n_toks = min(c:=self._chunk(tiers, len(tokens) - start_pos), len(tokens) - start_pos)
+      if self.config.ple: self.blk[self.config.ple.layer].ple.write_rows(tokens, start_pos, n_toks, max(tiers))
+      sp, nt = v_start_pos.bind(start_pos), tiers[c].bind(n_toks)
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, (sp,), temp).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
@@ -1073,3 +1272,89 @@ class Transformer:
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
+
+def _host_tensor(device:str, n:int, dtype) -> tuple[Tensor, Any]:
+  # an (n,) Tensor in host-visible memory and a memoryview of it: the host writes inputs and reads outputs directly
+  buf = Buffer(device, n * dtype.itemsize, options=BufferSpec(cpu_access=True)).ensure_allocated()
+  return Tensor(UOp.from_buffer(buf, dtype)), unwrap(buf._host_mv()).cast(dtype.fmt)
+
+class DecodeBatch:
+  """Decoding several sequences at once (e.g. a server's concurrent requests) on one model: each sequence holds one of `slots` rows of
+  the KV caches, which the model then allocates with that many rows (so the model takes no other calls). prefill() processes a
+  prompt into a row, reusing the prefix the row already holds, and returns its first token; step() decodes one token for each busy
+  row in one forward, so the weights are read once for all of them (idle rows cost nothing). Llama-style attention blocks only."""
+  def __init__(self, model:Transformer, slots:int):
+    assert slots >= 1 and not model.has_recurrent_block, "batched decode needs a model without recurrent blocks"
+    assert all(type(b) is TransformerBlock and b.indexer is None and not hasattr(b, "ple") and not hasattr(b, "cache_kv") for b in model.blk), \
+      "batched decode needs llama-style attention blocks, on a model that hasn't run yet"
+    for b in model.blk: setattr(b, "cache_rows", slots)
+    self.model, self.slots = model, slots
+    self.cached:list[list[int]] = [[] for _ in range(slots)]  # the tokens whose KV each row holds
+    ctx = model.max_context
+    self.v_slot, self.v_pos = UOp.variable("slot", 0, slots-1), UOp.variable("start_pos", 0, ctx-1)
+    self.v_rows = [UOp.variable(f"row_{i}", 0, slots-1) for i in range(slots)]
+    self.v_poss = [UOp.variable(f"start_pos_{i}", 0, ctx-1) for i in range(slots)]
+    self.prefill_jits:dict[int, Any] = {}  # TinyJit per chunk size
+    self.step_jits:dict[int, Any] = {}  # TinyJit per busy row count
+    # the steps' tokens, temperatures and outputs in host-visible memory: written and read as memory, without a copy program each
+    self.device = dev = cast(str, model.token_embd.weight.device)
+    (self._toks, self._toks_mv), (self._temps, self._temps_mv) = _host_tensor(dev, slots, dtypes.int32), _host_tensor(dev, slots, dtypes.float32)
+    (self._out, self._out_mv) = _host_tensor(dev, slots, dtypes.int32)
+
+  def _run(self, toks:Tensor, temps:Tensor, *rows_and_pos:UOp) -> Tensor:
+    # n sequences: rows_and_pos is their n cache rows, then their n positions. toks is (n, T) (prefill), or the step's host buffer
+    # whose first n are the tokens (slices of it can't be JIT inputs); temps one temperature, or the step's buffer
+    n = len(rows_and_pos) // 2
+    if toks.ndim == 1: toks, temps = toks[:n].reshape(n, 1), temps[:n]
+    out = self.model.forward_rows(toks, temps.reshape(-1, 1), tuple(rows_and_pos[:n]), *rows_and_pos[n:])
+    return self._out[:n].assign(out.flatten().cast(dtypes.int32)).realize()
+
+  def warmup(self):
+    # capture the step JIT for every busy row count and the prefill JIT for every chunk size, then forget what the rows hold
+    for c in self.model._prefill_tiers(None):
+      for _ in range(2):
+        self.cached[0] = []
+        self.prefill(0, [0] * c)
+    for n in range(1, self.slots + 1):
+      outs:list[int|None] = [self.prefill(s, [0]) if s < n else None for s in range(self.slots)]
+      for _ in range(3): outs = self.step(outs)
+    self.cached = [[] for _ in range(self.slots)]
+
+  def prefix_len(self, slot:int, tokens:list[int]) -> int:
+    # how much of tokens the row already holds (all but the last token at most: prefill samples after the last one)
+    return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self.cached[slot])))
+
+  def prefill(self, slot:int, tokens:list[int], temperature:float=0.0) -> int:
+    """Process tokens into row slot (from what it already holds) and return the token after them. The row then holds tokens."""
+    m, start = self.model, self.prefix_len(slot, tokens)
+    assert 0 < len(tokens) < m.max_context, "the prompt must fit the context"
+    t, tiers, temp = m._prompt(tokens), m._prefill_tiers(None), m._temperature(temperature)
+    self.cached[slot] = tokens[:start]
+    while start < len(tokens):
+      n = min(c:=m._chunk(tiers, len(tokens) - start), len(tokens) - start)
+      if (jit:=self.prefill_jits.get(c)) is None: jit = self.prefill_jits[c] = TinyJit(self._run, scratch=m.scratch)
+      sp = self.v_pos.bind(start)
+      jit(t[:, sp:sp+tiers[c].bind(n)], temp, self.v_slot.bind(slot), sp)
+      start += n
+    self.cached[slot] = list(tokens)
+    Device[self.device].synchronize()
+    return self._out_mv[0]
+
+  def step(self, tokens:list[int|None], temperatures:list[float]|None=None) -> list[int|None]:
+    """One token for each busy row r (tokens[r] not None, the row's last sampled token): tokens[r] goes in at position
+    len(cached[r]) and the row's next token is returned (None for idle rows). The caller stops a sequence before it fills the
+    context."""
+    assert len(tokens) == self.slots
+    busy = [r for r, t in enumerate(tokens) if t is not None]
+    if not busy: return [None] * self.slots
+    assert all(len(self.cached[r]) < self.model.max_context for r in busy), "a sequence filled the context"
+    temps = temperatures or [0.0] * self.slots
+    for i, r in enumerate(busy): self._toks_mv[i], self._temps_mv[i] = cast(int, tokens[r]), temps[r]
+    if (jit:=self.step_jits.get(n:=len(busy))) is None: jit = self.step_jits[n] = TinyJit(self._run, scratch=self.model.scratch)
+    jit(self._toks, self._temps, *(v.bind(r) for v, r in zip(self.v_rows, busy)),
+        *(v.bind(len(self.cached[r])) for v, r in zip(self.v_poss, busy)))
+    for r in busy: self.cached[r].append(cast(int, tokens[r]))
+    Device[self.device].synchronize()
+    out:list[int|None] = [None] * self.slots
+    for i, r in enumerate(busy): out[r] = self._out_mv[i]
+    return out

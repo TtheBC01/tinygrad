@@ -1,10 +1,11 @@
 #!/usr/bin/env python
-import unittest
+import unittest, gc, weakref
 import numpy as np
 from test.helpers import assert_jit_cache_len, not_support_multi_device, needs_second_gpu
 from tinygrad import Tensor, TinyJit, Device, dtypes, Context, UOp
 from tinygrad.helpers import DEV, GlobalCounters
-from tinygrad.engine.jit import JitError
+from tinygrad.engine.jit import JitError, ScratchPool
+from tinygrad.uop.ops import Ops
 from tinygrad.renderer.x86 import X86Renderer
 
 def _simple_test(add, extract=lambda x: x, N=10):
@@ -619,6 +620,38 @@ class TestJitFree(unittest.TestCase):
     self.assertTrue(x.uop.base.buffer.is_allocated())
     fxn(Tensor([2]))
     self.assertEqual(x.item(), 8)
+
+class TestJitScratchPool(unittest.TestCase):
+  @staticmethod
+  def _f(x:Tensor) -> Tensor: return ((x + 1).contiguous().exp2().contiguous() * 2).sum(1).realize()  # two intermediates
+
+  def test_shared_arena(self):
+    pool = ScratchPool()
+    small, big = TinyJit(self._f, scratch=pool), TinyJit(self._f, scratch=pool)
+    def check(jit, n:int, i:int):
+      x = (Tensor.arange(n * n).reshape(n, n).float() / (n * n) + i).clone().realize()
+      np.testing.assert_allclose(jit(x).numpy(), ((np.exp2(x.numpy() + 1)) * 2).sum(1), rtol=1e-5)
+    # the second JIT needs a bigger arena: the pool grows and the first moves to it, both stay correct when interleaved
+    for i in range(3): check(small, 32, i)
+    size = pool.nbytes()
+    for i in range(3): check(big, 128, i)
+    self.assertGreater(pool.nbytes(), size)
+    for i in range(4): check(small if i % 2 else big, 32 if i % 2 else 128, i)
+    # neither JIT has an arena of its own: both plan into the pool's one buffer
+    for j in (small, big):
+      self.assertEqual([u for u in j.captured._linear.toposort() if u.op is Ops.ALLOC and u.arg.name is None and u.max_numel() > 1024], [])
+      self.assertIn(pool.bufs[Device.DEFAULT], j.captured._linear.toposort())
+
+  def test_pool_buffer_freed_on_growth(self):
+    pool = ScratchPool()
+    small, big = TinyJit(self._f, scratch=pool), TinyJit(self._f, scratch=pool)
+    for _ in range(3): small(Tensor.ones(32, 32).contiguous().realize())
+    old = weakref.ref(pool.bufs[Device.DEFAULT].buffer)
+    for _ in range(3): big(Tensor.ones(128, 128).contiguous().realize())
+    small(Tensor.ones(32, 32).contiguous().realize())
+    # the grown buffer replaces the old one, which nothing holds anymore
+    gc.collect()
+    self.assertTrue(old() is None or not old().is_allocated())
 
 class TestJitGraphSplit(unittest.TestCase):
   def compute(self, device, inp):

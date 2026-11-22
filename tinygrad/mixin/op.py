@@ -1,6 +1,6 @@
 from __future__ import annotations
 import functools, itertools, math, string
-from typing import TYPE_CHECKING, Any, Callable, Self, Sequence, Literal, get_args
+from typing import TYPE_CHECKING, Any, Callable, Self, Sequence, Literal, get_args, cast
 from tinygrad.mixin.elementwise import ElementwiseMixin
 from tinygrad.mixin.movement import MovementMixin
 from tinygrad.mixin.reduce import ReduceMixin
@@ -8,7 +8,7 @@ from tinygrad.uop import Ops, GroupOp
 from tinygrad.uop.ops import _broadcast_shape, resolve, smax, smin, identity_element
 from tinygrad.dtype import ConstType, DType, DTypeLike, Invalid, PyConst, dtypes, least_upper_dtype, sum_acc_dtype, to_dtype, commit_int
 from tinygrad.helpers import all_int, argfix, ceildiv, flatten, flat_to_grouped, fully_flatten, get_shape, make_tuple, merge_dicts, prod
-from tinygrad.helpers import resolve_pool_pads, round_up, IMAGE, FLOAT16, WINO
+from tinygrad.helpers import resolve_pool_pads, round_up, IMAGE, FLOAT16, WINO, getenv
 
 if TYPE_CHECKING:
   from tinygrad.uop.ops import sint
@@ -1612,6 +1612,13 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     """
     if IMAGE: return self.image_conv2d(weight, bias, groups, stride, dilation, padding, dtype)
     if WINO and all(x == 3 for x in weight.shape[2:]) and stride == dilation == 1: return self._conv2d_winograd(weight, bias, groups, padding, dtype)
+    # NV_CONV=1: fp16 2d convolutions (kernel larger than 1x1, inference) on NV/CUDA sm_80+ as an implicit GEMM on the tensor cores
+    if getenv("NV_CONV") and type(self).__name__ == "Tensor" and groups == 1 and dilation == 1 and dtype is None and self.ndim == 4 and \
+       isinstance(stride, int) and isinstance(padding, int) and prod(weight.shape[2:]) > 1 and \
+       not getattr(self, "requires_grad", False) and not getattr(weight, "requires_grad", False):
+      from tinygrad.llm.kernels.nv import nv_conv2d
+      if (nv_ret:=nv_conv2d(cast(Any, self), cast(Any, weight), stride, padding)) is not None:
+        return cast(Self, nv_ret if bias is None else nv_ret + cast(Any, bias).reshape(1, -1, 1, 1))
     (bs,cin_), (cout,cin), HW = self.shape[:2], weight.shape[:2], weight.shape[2:]
     padding_ = resolve_pool_pads(padding, len(HW))
     assert groups*cin == cin_ and len(self.shape) == len(weight.shape),\

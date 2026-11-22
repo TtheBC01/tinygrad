@@ -48,7 +48,7 @@ packages = [
 
 [tool.setuptools.package-data]
 tinygrad = ["py.typed"]
-"tinygrad.llm" = ["chat.html"]
+"tinygrad.llm" = ["chat.html", "kernels/nv_gemm.cu", "kernels/nv_flash.cu", "kernels/nv_decode.cu", "kernels/nv_quant.cu", "kernels/nv_mmq.cu", "kernels/nv_common.cuh", "kernels/nv_decode_merge.cuh"]
 "tinygrad.viz" = ["index.html", "assets/**/*", "js/*"]
 
 

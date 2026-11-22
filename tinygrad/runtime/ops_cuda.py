@@ -28,7 +28,7 @@ def cu_launch_kernel(ctx:CUDADevice, call:UOp, prg:UOp) -> tuple:
   hdr = layout_args([UOp.const(v, dtypes.uint64) if isinstance(v, int) else v for v in (1, addr+48, 2, addr+40, ctx.launch_end, buf.max_numel()-48)])
   func = (p:=make_program(prg, 8, ctx.device)).after(p.store(prg)).bitcast(dtypes.u64).index(0).load()
   global_size, local_size = prg.arg.launch_dims(call)
-  return (cuda.cuLaunchKernel, func, *global_size, *local_size, 0, None, 0, patch(buf, hdr + rows).index(0))
+  return (cuda.cuLaunchKernel, func, *global_size, *local_size, prg.src[0].arg.dyn_shared_mem, None, 0, patch(buf, hdr + rows).index(0))
 
 pm_cuda = PatternMatcher([ # None is the stream
   (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="prg"),), name="call", allow_any_len=True), cu_launch_kernel),
@@ -106,18 +106,21 @@ class CUDADevice(Compiled):
     stamp = Buffer(HCQ_RUNTIME_DEV.device, 8, opaque=BufferStorage(int.from_bytes(bytes(fn), "little"), fn))
     Compiled.link_bufs |= {to_name(self.device, "handles"): handles, to_name(self.device, "stamp"): stamp}
     Compiled.pm_link += PatternMatcher([(UPat(Ops.ALLOC, name="p").store(UPat(Ops.PROGRAM, name="prg")), lambda p, prg, d=self:
-      p.store(UOp(Ops.BINARY, arg=d.function(prg.src[3].arg, prg.src[0].arg.function_name))) if p.device == d.device else None)])
+      p.store(UOp(Ops.BINARY, arg=d.function(prg.src[3].arg, prg.src[0].arg.function_name, prg.src[0].arg.dyn_shared_mem)))
+      if p.device == d.device else None)])
 
   def get_arch(self, device_id:int) -> str:
     check(cuda.cuDeviceComputeCapability(ctypes.byref(major:=ctypes.c_int()), ctypes.byref(minor:=ctypes.c_int()), device_id))
     return f"sm_{major.value}{minor.value}"
 
   @functools.cache
-  def function(self, lib:bytes, name:str) -> bytes:
+  def function(self, lib:bytes, name:str, dyn_shared_mem:int=0) -> bytes:
     if DEBUG >= 5 and self.api is cuda: print("\n".join([f"{i+1:>3} {line}" for i, line in enumerate(pretty_ptx(lib.decode()).split("\n"))]))
     check(self.api.cuCtxSetCurrent(self.context))
     check(self.api.cuModuleLoadData(ctypes.byref(module:=self.api.CUmodule()), lib))
     check(self.api.cuModuleGetFunction(ctypes.byref(func:=self.api.CUfunction()), module, name.encode()))
+    # launches asking for more than the default 48 KB of dynamic shared memory must opt in per function
+    if dyn_shared_mem: check(self.api.cuFuncSetAttribute(func, cuda.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dyn_shared_mem))
     return bytes(func)
 
   def count(self) -> int: return init_c_var(ctypes.c_int, lambda x: check(self.api.cuDeviceGetCount(ctypes.byref(x)))).value

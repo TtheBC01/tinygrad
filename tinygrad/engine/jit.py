@@ -1,9 +1,9 @@
 from typing import TypeVar, Generic, Callable, Any, overload
-import functools
+import functools, weakref
 from tinygrad.tensor import Tensor, all_tensors
 from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, JIT, pluralize, VIZ, disable_gc
 from tinygrad.device import Buffer, MultiBuffer
-from tinygrad.dtype import DType
+from tinygrad.dtype import DType, dtypes
 from tinygrad.uop.ops import UOp, PatternMatcher, Variable, Ops, rewrite_group, graph_rewrite
 from tinygrad.engine.realize import capturing, compile_linear, link_linear, run_linear
 from tinygrad.codegen.memory import memory_plan_rewrite, _collect_bufs
@@ -21,15 +21,33 @@ def prune_linear(linear:UOp, needed:set[UOp]) -> tuple[UOp, UOp]:
     else: onetime.append(si)
   return linear.replace(src=tuple(kept)), linear.replace(src=tuple(onetime))
 
-@rewrite_group(lambda linear,held_bufs,input_uops,ret=(): f"JIT {pluralize('call', len(linear.src))}")
-def jit_lower(linear:UOp, held_bufs:set[UOp], input_uops:list[UOp]) -> UOp:
+class ScratchPool:
+  """Scratch memory shared by JITs that never run at the same time, e.g. the JITs of one model's steps, which run one after another on
+  each device's queue: every JIT's compute arena (its planned intermediates) is a view of the pool's buffer for that device, sized to
+  the largest, instead of an arena of its own. Only for JITs whose runs don't overlap: one's run would clobber another's scratch."""
+  def __init__(self):
+    self.bufs:dict[str, UOp] = {}
+    self.users:list[weakref.ref[CapturedJit]] = []
+  def arena(self, device:str, nbytes:int) -> UOp:
+    if (old:=self.bufs.get(device)) is None or old.max_numel() < nbytes:
+      new = self.bufs[device] = UOp.new_buffer(device, nbytes, dtypes.int8)
+      # the JITs planned into the old buffer move to the new one (relinked on their next call), the old one is freed with their links
+      if old is not None:
+        self.users = [r for r in self.users if r() is not None]
+        for r in self.users:
+          if (cj:=r()) is not None: cj.replace_buffer(old, new)
+    return self.bufs[device]
+  def nbytes(self) -> int: return sum(b.max_numel() for b in self.bufs.values())
+
+@rewrite_group(lambda linear,held_bufs,input_uops,scratch=None,ret=(): f"JIT {pluralize('call', len(linear.src))}")
+def jit_lower(linear:UOp, held_bufs:set[UOp], input_uops:list[UOp], scratch:ScratchPool|None=None) -> UOp:
   if VIZ: graph_rewrite(linear, PatternMatcher([]), name="View captured linear")
 
   # parametrize input buffers: map each input buffer UOp to a PARAM with the correct slot index
   linear = linear.substitute({u: UOp.param(i, u.dtype, u.max_numel(), u.device) for i,u in enumerate(input_uops)}, walk=True)
   # storage no one outside the jit holds is scratch: it's planned and bound at link
-  scratch = {u: UOp.alloc((u.max_numel(),), u.dtype, device=u.device) for u in linear.toposort() if u.op is Ops.BUFFER and u not in held_bufs}
-  linear = memory_plan_rewrite(linear.substitute(scratch, walk=True))
+  bufs = {u: UOp.alloc((u.max_numel(),), u.dtype, device=u.device) for u in linear.toposort() if u.op is Ops.BUFFER and u not in held_bufs}
+  linear = memory_plan_rewrite(linear.substitute(bufs, walk=True), scratch.arena if scratch is not None else None)
   linear = compile_linear(linear, beam=getenv("JITBEAM", BEAM.value), input_uops=input_uops, cache=False)
   if VIZ: graph_rewrite(linear, PatternMatcher([]), name="View compiled linear")
   return linear
@@ -78,6 +96,12 @@ class CapturedJit(Generic[ReturnType]):
 
   def free_intermediates(self): self._linears.clear()
 
+  def replace_buffer(self, old:UOp, new:UOp):
+    # a ScratchPool grew: plan into its new buffer, relink on the next call
+    self._linear = self._linear.substitute({old: new}, walk=True)
+    self._linears.clear()
+    self.__dict__.pop("_jit_bufs", None)
+
 def _prepare_jit_inputs(args, kwargs):
   input_tensors: list[tuple[int|str, Tensor]] = [(name,t) for name,t in list(enumerate(args))+sorted(kwargs.items()) if t.__class__ is Tensor]
   names, tensors = [name for name,_ in input_tensors], [t for _,t in input_tensors]
@@ -99,12 +123,13 @@ def _prepare_jit_inputs(args, kwargs):
   return input_buf_uops, var_vals, names, expected_input_info
 
 class _TinyJit(Generic[ReturnType]):
-  def __init__(self, fxn:Callable[..., ReturnType]|None, captured:CapturedJit|None=None, prune=False):
+  def __init__(self, fxn:Callable[..., ReturnType]|None, captured:CapturedJit|None=None, prune=False, scratch:ScratchPool|None=None):
     assert fxn or captured, "need either a function or a CapturedJit"
     self.fxn = fxn
     self.captured: CapturedJit|None = captured
     self.cnt: int = 2 if self.fxn is None else 0
     self.prune = prune
+    self.scratch = scratch  # plan the intermediates into this shared pool
 
   def add_linear(self, linear:UOp, var_vals:dict[str, int]): self._linears.append((linear, var_vals))
 
@@ -159,11 +184,12 @@ class _TinyJit(Generic[ReturnType]):
       def _buf_or_none(u:UOp) -> Buffer|MultiBuffer|None: return u.arg.buffer if u.op is Ops.BUFFER else None
       held_bufs = {u for tref in list(all_tensors) if (t:=tref()) is not None for u in t.uop.toposort() if _buf_or_none(u) is not None}
       held_bufs |= {u for u in big_linear.toposort() if (b:=_buf_or_none(u)) is not None and b.is_allocated()}
-      linear = jit_lower(big_linear, held_bufs, input_buf_uops)
+      linear = jit_lower(big_linear, held_bufs, input_buf_uops, self.scratch)
       # drop the pre-planning graph: it keeps the whole capture-time working set allocated (big_linear) or referenced (held_bufs).
       # the planned linear only uses the arena/held buffers, so the intermediates must be freed before linking and first exec
       del big_linear, held_bufs
       self.captured = CapturedJit(ret, linear, names, expected_input_info, capture_var_vals)
+      if self.scratch is not None: self.scratch.users.append(weakref.ref(self.captured))
       ret = self.captured(input_buf_uops, var_vals)
     elif self.cnt >= 2:
       # jit exec
@@ -178,7 +204,7 @@ class _TinyJit(Generic[ReturnType]):
 
 # overload signatures support both @TinyJit and @TinyJit(prune=True) syntax
 @overload
-def TinyJit(fxn:Callable[..., ReturnType], *, prune:bool=False) -> _TinyJit[ReturnType]: ...
+def TinyJit(fxn:Callable[..., ReturnType], *, prune:bool=False, scratch:ScratchPool|None=None) -> _TinyJit[ReturnType]: ...
 @overload
-def TinyJit(fxn:None=None, *, prune:bool=False) -> Callable[[Callable[..., ReturnType]], _TinyJit[ReturnType]]: ...
+def TinyJit(fxn:None=None, *, prune:bool=False, scratch:ScratchPool|None=None) -> Callable[[Callable[..., ReturnType]], _TinyJit[ReturnType]]: ...
 def TinyJit(fxn=None, **kwargs): return (lambda f: _TinyJit(f, **kwargs)) if fxn is None else _TinyJit(fxn, **kwargs)

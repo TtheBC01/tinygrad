@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import Callable
 from tinygrad.helpers import NO_MEMORY_PLANNER, DEBUG, round_up, to_tuple
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.dtype import dtypes
@@ -16,7 +17,8 @@ def _can_plan(b:UOp) -> bool:
 
 LaneKey = tuple[str, int]
 
-def memory_plan_rewrite(linear:UOp) -> UOp:
+def memory_plan_rewrite(linear:UOp, arena:Callable[[str, int], UOp]|None=None) -> UOp:
+  # arena(device, nbytes): an int8 BUFFER of at least nbytes to plan a device's compute lane into instead of a new ALLOC (see ScratchPool)
   if NO_MEMORY_PLANNER: return linear
 
   # compute lifetimes for all plannable internal buffers
@@ -51,7 +53,8 @@ def memory_plan_rewrite(linear:UOp) -> UOp:
   arena_sizes = {key: round_up(peak, block_size) for key, (peak, _) in peaks.items()}
 
   # build replace_map: each buffer becomes a SHRINK/BITCAST into a shared per-device-lane arena
-  arenas = {key: UOp.alloc((sz,), dtypes.int8, device=key[0]) for key, sz in arena_sizes.items()}
+  arenas = {key: arena(key[0], sz) if arena is not None and isinstance(key[0], str) and key[1] == 0 else UOp.alloc((sz,), dtypes.int8, device=key[0])
+            for key, sz in arena_sizes.items()}
   replace_map = {buf_uop:arenas[_key(buf_uop)][offset:offset+buf_uop.nbytes()].bitcast(buf_uop.dtype) for buf_uop, offset in offsets.items()}
 
   if DEBUG >= 1 and (omem:=sum(nbytes.values()) / 1e6) != (nmem:=sum(arena_sizes.values()) / 1e6):

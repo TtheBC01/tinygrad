@@ -1,11 +1,13 @@
 from __future__ import annotations
-import functools, math
-from typing import cast
+import functools, itertools, math
+from typing import Callable, Sequence, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, unwrap
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
+from tinygrad.llm.kernels.nv import nv_linear, nv_quant_gemv, nv_dequant, nv_gemm_supported, nv_note_rmsnorm, NV_QUANT_UNIT, NV_QUANT_MAX_TOKENS
+from tinygrad.llm.kernels.nv import nv_mmq, nv_residual_add, QuantSeg, Glu
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -33,12 +35,12 @@ def _gfx_version(device:str|tuple[str, ...]|None) -> tuple[int, ...]:
 def _is_rdna4(device:str|tuple[str, ...]|None) -> bool: return _gfx_version(device)[0] == 12
 def _is_cdna(device:str|tuple[str, ...]|None) -> bool: return _gfx_version(device)[0] == 9
 
-def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
-  for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
-    if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
-    other = UOp.native(f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))",
-                       shape=val.shape, dtype=dtypes.float, fmt=True).call(val)
-    val = val.maximum(other) if maximum else val + other
+def warp_reduce(val:UOp, op:Ops=Ops.ADD, full_wave:bool=False, masks:tuple[int, ...]|None=None) -> UOp:
+  if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
+  assert val.dtype in (dtypes.float32, dtypes.int32, dtypes.uint32)
+  for mask in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)) if masks is None else masks:
+    swizzle = UOp.native(f"__builtin_amdgcn_ds_swizzle({{0}}, {0x1f | mask<<10})", shape=val.shape, dtype=dtypes.int32, fmt=True)
+    val = val.alu(op, swizzle.call(val.bitcast(dtypes.int32)).bitcast(val.dtype))
   return val
 
 def _reg(shape:tuple[int, ...], value:float, dep:UOp|None=None) -> UOp:
@@ -71,6 +73,9 @@ class Linear(nn.Linear):
   shard_axis:int|None = None
   weight_scale_inv:Tensor|None = None
   weight_block_size:tuple[int, int] = (128, 128)
+  # (w, n_heads, rope_dim) when the weight is model.permute_rope(w, n_heads, rope_dim): a GGUF q/k projection, whose rows the
+  # loader reorders for RoPE. A kernel can read w's packed blocks instead and permute its output the same way.
+  rope_source:tuple[Tensor, int, int]|None = None
   def __init__(self, in_features:int, out_features:int, bias=True, groups:int=1):
     super().__init__(in_features, out_features, bias)
     # groups > 1: x is (..., groups, in_features), group g multiplies the g-th block of out_features//groups weight rows
@@ -80,6 +85,29 @@ class Linear(nn.Linear):
     if (found:=find_packed(decoded, self.in_features)) is None: return
     self.ggml_type, self.weight = found
     self.shard_axis = decoded.uop.axis
+  def _nv_packed(self) -> tuple[int, Tensor]|None:
+    # (ggml type, packed blocks) when the weight is the dequantization of GGUF blocks, found once
+    if not hasattr(self, "_nv_packed_cache"):
+      self._nv_packed_cache = None
+      if self.ggml_type is None and self.weight.uop.axis is None and nv_gemm_supported(self.weight.device) and not getenv("DISABLE_NV_QUANT"):
+        from tinygrad.llm.kernels.amd_gguf import find_packed
+        w = self.weight if self.rope_source is None else self.rope_source[0]
+        self._nv_packed_cache = find_packed(w, self.in_features)
+    return self._nv_packed_cache
+  def _nv_quant_seg(self) -> QuantSeg|None:
+    # this layer's weight for the NV GEMV / dequant kernels (GGUF Q4_K, Q6_K or Q8_0 blocks), or None if they can't take it
+    if self.groups != 1 or self.ggml_type is not None or self.weight_scale_inv is not None or not nv_gemm_supported(self.weight.device): return None
+    if (packed:=self._nv_packed()) is None or packed[0] not in NV_QUANT_UNIT: return None
+    return packed[1], packed[0], self.out_features
+  def _nv_out(self, out:Tensor) -> Tensor:
+    # finish a kernel's output read from the packed blocks: model.permute_rope on the output features (the same reordering the
+    # loader applied to the weight's rows), then the bias
+    if self.rope_source is not None:
+      _, n_heads, rope_dim = self.rope_source
+      x = out.reshape(*out.shape[:-1], n_heads, self.out_features // n_heads)
+      prefix = x.shape[-1] - rope_dim
+      out = x[..., :prefix].cat(x[..., prefix:].rearrange("... (h two) -> ... (two h)", two=2), dim=-1).reshape(out.shape)
+    return out if self.bias is None else out + self.bias
   def __call__(self, x:Tensor) -> Tensor:
     from tinygrad.llm.kernels.amd_gguf import QUANT_SIZES, q8_linear
     if self.weight_scale_inv is not None:
@@ -104,10 +132,93 @@ class Linear(nn.Linear):
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features // self.groups)))
+    # NV/CUDA (sm_80+, tinygrad/llm/kernels/nv.py): decode on GGUF Q4_K/Q6_K/Q8_0 weights runs a dp4a GEMV on the packed blocks;
+    # prefill-sized matmuls run on the hand-written tensor core GEMM, on dense fp16 weights or Q4_K/Q6_K/Q8_0 ones dequantized
+    # to fp16 right before (other quant types keep tinygrad's matmul, which dequantizes as it reads)
+    if self.groups == 1 and self.ggml_type is None and nv_gemm_supported(self.weight.device):
+      if self._nv_quant_seg() is not None:
+        if (fused:=_nv_fused(x, [self])) is not None: return self._nv_out(fused[0].cast(x.dtype))
+      elif self._nv_packed() is None and (nv_out:=nv_linear(x, _view_back(self.weight))) is not None:
+        return nv_out if self.bias is None else nv_out + self.bias
     if self.groups > 1:
       out = (x.unsqueeze(-2) @ self.weight.reshape(self.groups, -1, self.in_features).transpose(-1, -2)).squeeze(-2)
       return out if self.bias is None else out + self.bias.reshape(self.groups, -1)
     return super().__call__(x)
+
+def residual_add(x:Tensor, y:Tensor) -> Tensor:
+  """x + y. On NV/CUDA, when y is a GGUF quant GEMV's output (decode), the GEMV adds x as it stores (no separate add kernel)."""
+  return out if (out:=nv_residual_add(x, y)) is not None else x + y
+
+class RMSNorm(nn.RMSNorm):
+  """nn.RMSNorm. On NV/CUDA, a GGUF quant GEMV of its output (decode) applies the norm itself while quantizing the activations, so
+  the norm's own kernels don't run."""
+  def __call__(self, x:Tensor) -> Tensor:
+    out = super().__call__(x)
+    if self.weight is not None and nv_gemm_supported(x.device): nv_note_rmsnorm(out, x, self.weight, self.eps)
+    return out
+
+def _nv_fused(x:Tensor, lins:Sequence[Linear]) -> tuple[Tensor, bool]|None:
+  """(x @ concat(weights).T, decode) for Linears that share x and whose weights are GGUF Q4_K/Q6_K/Q8_0 blocks, as one NV kernel:
+  the GEMV on the packed blocks for a few tokens (decode, fp32 result), else one dequantize into a single fp16 weight and one GEMM
+  (x's dtype). Before bias and RoPE output permutation (Linear._nv_out). None if a weight or x doesn't fit."""
+  K = lins[0].in_features
+  if any(l.in_features != K for l in lins) or (len(lins) > 1 and getenv("DISABLE_NV_FUSE")): return None
+  segs = [seg for l in lins if (seg:=l._nv_quant_seg()) is not None]
+  if len(segs) != len(lins): return None
+  if (out:=nv_quant_gemv(x, segs, K)) is not None: return out, True
+  # prefill: the int8 GEMM on the requantized blocks (fp32 out), else the fp16 GEMM, which takes the shape and dtype from this
+  # placeholder (never realized) and the weight from nv_dequant
+  if (out:=nv_mmq(x, segs, K)) is not None: return out, False
+  weight = Tensor.empty(sum(n for _, _, n in segs), K, dtype=dtypes.half, device=x.device)
+  return None if (out:=nv_linear(x, weight, functools.partial(nv_dequant, segs, K))) is None else (out, False)
+
+def _nv_split(out:Tensor, lins:Sequence[Linear], dtype) -> list[Tensor]:
+  offs = [0, *itertools.accumulate(l.out_features for l in lins)]
+  return [l._nv_out(out[..., a:b].cast(dtype)) for l, a, b in zip(lins, offs, offs[1:])]
+
+def fused_linear(x:Tensor, *lins:Linear) -> list[Tensor]:
+  """[lin(x) for lin in lins]. On NV/CUDA with GGUF Q4_K/Q6_K/Q8_0 weights (e.g. attention's q/k/v) it's one GEMV launch in decode,
+  one dequantize and one GEMM in prefill."""
+  if (fused:=_nv_fused(x, lins)) is not None: return _nv_split(fused[0], lins, x.dtype)
+  return [l(x) for l in lins]
+
+def _nv_glu_prefill(x:Tensor, gate:Linear, up:Linear, down:Linear, glu:Glu) -> Tensor|None:
+  # prefill: one dequantize writes gate's and up's rows interleaved, the GEMM applies SwiGLU to each (gate, up) column pair as it
+  # stores (fp16, the down GEMM's input as is), then down's dequantize and GEMM (fp32 out). None if it doesn't apply.
+  tokens, H = prod(x.shape[:-1]), gate.out_features
+  if isinstance(tokens, int) and tokens <= NV_QUANT_MAX_TOKENS: return None  # decode: the GEMVs
+  if getenv("DISABLE_NV_GLU_FUSE") or up.out_features != H or down.in_features != H or gate.in_features != up.in_features: return None
+  if any(l.bias is not None or l.rope_source is not None for l in (gate, up)) or down.rope_source is not None: return None
+  if (s0:=gate._nv_quant_seg()) is None or (s1:=up._nv_quant_seg()) is None or (sd:=down._nv_quant_seg()) is None: return None
+  K = gate.in_features
+  # a symbolic token count: run both GEMMs on the padded rows and slice once at the end (slicing the activation and padding it
+  # again for down would copy it)
+  xs = x if isinstance(tokens, int) else x.pad_to(x.max_shape)
+  # the int8 GEMMs, else the fp16 ones on dequantized weights
+  if (act:=nv_mmq(xs, [s0, s1], K, glu=glu, interleave=True)) is None:
+    act = nv_linear(xs, Tensor.empty(2 * H, K, dtype=dtypes.half, device=x.device),
+                    functools.partial(nv_dequant, [s0, s1], K, interleave=True), glu=glu)
+  if act is None: return None
+  if (out:=nv_mmq(act, [sd], H)) is not None: out = out.cast(x.dtype)
+  else: out = nv_linear(act, Tensor.empty(down.out_features, H, dtype=dtypes.half, device=x.device), functools.partial(nv_dequant, [sd], H),
+                        out_dtype=x.dtype)
+  if out is None: return None
+  return down._nv_out(out if xs is x else out.shrink(tuple((0, s) for s in (*x.shape[:-1], down.out_features))))
+
+def glu_ffn(x:Tensor, gate:Linear, up:Linear, down:Linear, act:Callable[[Tensor, Tensor], Tensor], glu:Glu|None) -> Tensor:
+  """down(act(gate(x), up(x))). On NV/CUDA with GGUF Q4_K/Q6_K/Q8_0 weights gate and up run as one kernel (fused_linear), and act is
+  applied inside a kernel when glu gives its SwiGLU constants (None: act is something else): in decode in down's activation
+  quantization, in prefill in the gate/up GEMM's epilogue."""
+  if glu is not None and gate.groups == up.groups == down.groups == 1 and nv_gemm_supported(x.device) and \
+     (out:=_nv_glu_prefill(x, gate, up, down, glu)) is not None: return out
+  if (fused:=_nv_fused(x, (gate, up))) is None: return down(act(gate(x), up(x)))
+  gu, decode = fused
+  H = gate.out_features
+  if decode and glu is not None and up.out_features == H == down.in_features and gate.bias is None and up.bias is None and \
+     gate.rope_source is None and up.rope_source is None and (seg:=down._nv_quant_seg()) is not None and \
+     (out:=nv_quant_gemv(gu, [seg], H, glu=glu)) is not None:
+    return down._nv_out(out.cast(x.dtype))
+  return down(act(*_nv_split(gu, (gate, up), x.dtype)))
 
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
@@ -357,7 +468,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   m_ij, rm2 = _reg((TM,), -math.inf, n_tile), UOp.range(TN, 261)
   m_ij = m_ij.after(m_ij.store(m_ij.after(rm2).maximum(S_reg[:, rm2])).end(rm2))
   ri_w = UOp.range(TM, 270)
-  m_ij = m_ij.after(m_ij[ri_w].store(warp_reduce(m_ij[ri_w], maximum=True)).end(ri_w))
+  m_ij = m_ij.after(m_ij[ri_w].store(warp_reduce(m_ij[ri_w], Ops.MAX)).end(ri_w))
   tile_max = m_ij.reshape(TM, 1).expand(TM, TN).maximum(-1e30)
   S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
   p_local, ri_ws = _reg((TM,), 0, n_tile), UOp.range(TM, 295)

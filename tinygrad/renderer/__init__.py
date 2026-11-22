@@ -36,11 +36,12 @@ class TinyELF:
   # tuple of (name, addrspace, dtype, shape), one per arg in the kernel's order. an ALU arg is a value, the rest are buffers
   signature: tuple[tuple[str|None, AddrSpace, DType, tuple], ...]
   profile_key: bytes|None = None
+  dyn_shared_mem: int = 0 # bytes of dynamic shared memory the launch must reserve on top of the program's static shared memory
 
   @staticmethod
   def from_program(prg:UOp) -> TinyELF:
     sig = tuple((p.arg.name, p.arg.addrspace, p.dtype, p._shape) for p in prg.kernel_params)
-    return TinyELF(prg.src[3].arg, prg.src[0].arg.function_name, prg.arg.target, sig, prg.key)
+    return TinyELF(prg.src[3].arg, prg.src[0].arg.function_name, prg.arg.target, sig, prg.key, prg.src[0].arg.dyn_shared_mem)
 
   @staticmethod
   def iter_sig(signature:tuple[tuple[str|None, AddrSpace, DType, tuple], ...], offset:int=0) -> Generator[tuple[int, DType], None, None]:
