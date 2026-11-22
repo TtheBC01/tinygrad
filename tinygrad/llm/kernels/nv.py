@@ -478,30 +478,48 @@ class MmqCfg:
   def BK(self) -> int: return 32 * self.NBLK  # in int8 (= K elements)
   @property
   def threads(self) -> int: return (self.BM // self.WM) * (self.BN // self.WN) * 32
+  def brow(self, raw:bool) -> int: return 176 if raw else self.BK + self.NBLK * 8  # B stage row stride (nv_mmq.cu BROW)
+  def smem(self, raw:bool=True) -> int:  # nv_mmq.cu: A tiles + scales, B rows, per-warp decoded B scales (packed formats)
+    return self.STAGES * (self.BM * (self.BK + self.NBLK * 8) + self.BN * self.brow(raw)) + raw * self.threads // 32 * self.WN * self.NBLK * 8
   @property
-  def smem(self) -> int: return self.STAGES * (self.BM + self.BN) * (self.BK + self.NBLK * 8)
-  @property
-  def blocks_per_sm(self) -> int: return max(1, min(48 * 32 // self.threads, (100 * 1024) // (self.smem + 1024)))
+  def blocks_per_sm(self) -> int: return max(1, min(48 * 32 // self.threads, (100 * 1024) // (self.smem() + 1024)))
   def __str__(self): return f"{self.BM}x{self.BN}_w{self.WM}x{self.WN}_s{self.STAGES}b{self.NBLK}" + ("_sk" if self.SK else "")
 MMQ = MmqCfg()
 Q6_K_TYPE = 14
 
-def _mmq_program(C:UOp, X:UOp, W8:UOp, WS:UOp, SKWS:UOp, FLAGS:UOp, cfg:MmqCfg, sp:Split, k:int, n:int, q6:str, has_min:bool,
-                 glu:Glu|None) -> UOp:
-  M = int(C.shape[0])
-  name = f"nv_mmq_{M}_{n}_{k}_{cfg}{sp.sk_p or ''}" + ("_q6" if q6 != "false" else "") + ("" if has_min else "_nomin")
+# a B segment of the int8 GEMM: (format, first column, last column, number of pointer arguments); formats as nv_mmq.cu's F_*
+MmqSeg = tuple[int, int, int, int]
+F_I8, F_I8Q6, F_Q4K, F_Q8, F_IL = 0, 1, 2, 3, 4
+
+def _mmq_program(C:UOp, X:UOp, *srcs:UOp, cfg:MmqCfg, sp:Split, k:int, n:int, msegs:tuple[MmqSeg, ...], glu:Glu|None) -> UOp:
+  M, (SKWS, FLAGS), wsrcs = int(C.shape[0]), srcs[-2:], srcs[:-2]
+  code = "x".join({F_I8: "i", F_I8Q6: "i6", F_Q4K: "r12", F_Q8: "r8"}[f & 3] + ("il" if f & F_IL else "") for f, _, _, _ in msegs)
+  name = f"nv_mmq_{M}_{n}_{k}_{cfg}{sp.sk_p or ''}_{code}"
+  # pick the tile's segment pointers first, then one mainloop per distinct format (each instantiation is a full copy of the loop)
+  params, sel, pi = [], [], 0
+  for i, (f, a, b, nptr) in enumerate(msegs):
+    names = [f"W{pi + j}" for j in range(nptr)]
+    params += [f"const {'float2' if (f & 3) <= F_I8Q6 and j == 1 else 'unsigned char'} *__restrict__ {nm}" for j, nm in enumerate(names)]
+    asg = f"{{ wa = {names[0]}; wb = {names[1] if nptr > 1 else 'nullptr'}; nb = bn - {a}; f = {f}; }}"
+    sel.append(asg if i == len(msegs) - 1 else f"if (bn < {b}) {asg}")
+    pi += nptr
+  fmts = sorted(set(f for f, _, _, _ in msegs))
+  raw = any((f & 3) >= F_Q4K for f in fmts)
+  run = " else ".join(f"if (f == {f}) mainloop<{f}>(t, wa, wb, nb, k0, k1);" for f in fmts[:-1]) + \
+        (" else " if len(fmts) > 1 else "") + f"mainloop<{fmts[-1]}>(t, wa, wb, nb, k0, k1);"
+  seg_run = "{ const unsigned char *wa; const void *wb; int nb, f; " + " else ".join(sel) + " " + run + " }"
   defines:dict[str, Any] = {"M_DIM": M, "N_DIM": n, "K_DIM": k, "BM": cfg.BM, "BN": cfg.BN, "WM": cfg.WM, "WN": cfg.WN,
-                            "STAGES": cfg.STAGES, "NBLK": cfg.NBLK, "GROUP_M": cfg.GROUP_M, "SK_P": sp.sk_p, "IS_Q6(bn)": f"({q6})",
-                            "HAS_MIN": int(has_min)}
+                            "STAGES": cfg.STAGES, "NBLK": cfg.NBLK, "GROUP_M": cfg.GROUP_M, "SK_P": sp.sk_p, "SEG_PARAMS": ", ".join(params),
+                            "SEG_RUN(k0, k1)": seg_run, "BROW": cfg.brow(raw), "HAS_RAW": int(raw)}
   if glu is not None:
     suffix, gdefs = _glu_defines(glu)
     name, defines = name + suffix, {**defines, **gdefs}
   src = "".join(f"#define {kk} {v}\n" for kk, v in {**defines, "KNAME": name}.items()) + MMQ_SRC
   threads, blocks = UOp.special(cfg.threads, "lidx0"), UOp.special(sp.grid, "gidx0")
-  io = M * k * 5 // 4 + n * k * 5 // 4 + int(C.shape[1]) * M * C.dtype.itemsize
+  io = M * k * 5 // 4 + n * k * 5 // 8 + int(C.shape[1]) * M * C.dtype.itemsize
   est = Estimates(ops=2 * M * n * k, lds=io, mem=io)
-  sink = UOp.sink(C.base, X.base, W8.base, WS.base, SKWS.base, FLAGS.base, threads, blocks,
-                  arg=KernelInfo(name, estimates=est, dyn_shared_mem=cfg.smem))
+  sink = UOp.sink(C.base, X.base, *[w.base for w in wsrcs], SKWS.base, FLAGS.base, threads, blocks,
+                  arg=KernelInfo(name, estimates=est, dyn_shared_mem=cfg.smem(raw)))
   return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src)))
 
 def nv_requant(segs:Sequence[QuantSeg], in_features:int, dep:Tensor, interleave:bool=False) -> tuple[Tensor, Tensor]|None:
@@ -510,6 +528,7 @@ def nv_requant(segs:Sequence[QuantSeg], in_features:int, dep:Tensor, interleave:
   N, K = sum(n for _, _, n in segs), in_features
   if not segs or (N * K) % 4096 or not all(_seg_ok(seg, K, dep.device) for seg in segs): return None
   if interleave and (len(segs) != 2 or segs[0][2] != segs[1][2]): return None
+  if any((off:=_byte_offset(p)) is None or off % NV_QUANT_ALIGN[q] for p, q, _ in segs): return None  # (Q4_K: 128-bit loads)
   fxn = functools.partial(_quant_program, stage="REQUANT", k=K, ntok=0, segs=tuple((q, n) for _, q, n in segs), interleave=interleave)
   w8, ws = Tensor.empty(N, K, dtype=dtypes.int8, device=dep.device), Tensor.empty(N, K // 32, 2, dtype=dtypes.float32, device=dep.device)
   w8, ws = Tensor.custom_kernel(w8, ws, *(p for p, _, _ in segs), dep, fxn=fxn)[:2]
@@ -527,25 +546,45 @@ def nv_mmq(x:Tensor, segs:Sequence[QuantSeg], in_features:int, glu:Glu|None=None
   if not isinstance(M, int) or M < MMQ.BM: return None
   Mp = -(-M // MMQ.BM) * MMQ.BM
   if (Mp - M) * 8 > M: return None  # too much padding: the fp16 GEMM has smaller tiles
-  # tiles in a Q6_K segment take the two-scale path, decided per tile: a Q6_K segment's ends have to fall on tile boundaries
-  is6 = [q == Q6_K_TYPE for _, q, _ in segs]
-  if interleave:
-    if len(segs) != 2 or is6[0] != is6[1]: return None
-    bounds = [(0, N)] if is6[0] else []
-  else: bounds = [(a, a + n) for a, (_, _, n), q6s in zip(itertools.accumulate((n for _, _, n in segs), initial=0), segs, is6) if q6s]
-  if any(a % MMQ.BN or b % MMQ.BN for a, b in bounds): return None
-  q6 = " || ".join(f"(bn >= {a} && bn < {b})" for a, b in bounds) or "false"
+  # each 128-column tile reads one segment, in one format: the packed Q4_K / Q8_0 blocks as they are (16 / 8-byte aligned), else
+  # (Q6_K, misaligned) the requantized int8 copy; so segment boundaries have to fall on tiles
+  starts = list(itertools.accumulate((n for _, _, n in segs), initial=0))
+  if any(a % MMQ.BN for a in starts) or not all(_seg_ok(seg, K, x.device) for seg in segs): return None
+  def raw_fmt(seg:QuantSeg) -> int|None:
+    if getenv("NV_MMQ_REQUANT") or (off:=_byte_offset(seg[0])) is None: return None
+    return F_Q4K if seg[1] == 12 and off % 16 == 0 else F_Q8 if seg[1] == 8 and off % 8 == 0 else None
   x2 = xs.reshape(M, K)
   if Mp != M: x2 = x2.pad(((0, Mp - M), None))
   xq = _quantize_x(x2, Mp, K, None)
-  if (wq:=nv_requant(segs, K, xq, interleave)) is None: return None
+  msegs:list[MmqSeg] = []
+  wts:list[Tensor] = []
+  if interleave:
+    if len(segs) != 2 or segs[0][1] != segs[1][1]: return None
+    if (f:=raw_fmt(segs[0])) is not None and raw_fmt(segs[1]) == f: msegs, wts = [(f | F_IL, 0, N, 2)], [segs[0][0], segs[1][0]]
+    else:
+      if (wq:=nv_requant(segs, K, xq, interleave=True)) is None: return None
+      msegs, wts = [(F_I8Q6 if segs[0][1] == Q6_K_TYPE else F_I8, 0, N, 2)], list(wq)
+  else:
+    # consecutive requantized segments of one kind share a requant launch and a segment
+    groups:list[tuple[int, int, list[QuantSeg]]] = []
+    for seg, a in zip(segs, starts):
+      f = raw_fmt(seg)
+      if f is None: f = F_I8Q6 if seg[1] == Q6_K_TYPE else F_I8
+      if groups and f <= F_I8Q6 and groups[-1][0] == f: groups[-1][2].append(seg)
+      else: groups.append((f, a, [seg]))
+    for f, a, gsegs in groups:
+      if f >= F_Q4K: wl = [gsegs[0][0]]
+      elif (wq:=nv_requant(gsegs, K, xq)) is None: return None
+      else: wl = list(wq)
+      msegs.append((f, a, a + sum(g[2] for g in gsegs), len(wl)))
+      wts += wl
   sp = split(Mp, N, K, MMQ, num_sms(x.device))
   skws = Tensor.empty(sp.sk_workers * MMQ.BM * MMQ.BN if sp.sk_workers else 1, dtype=dtypes.float32, device=x.device)
   flags = _flags(x.device) if sp.sk_workers else Tensor.empty(1, dtype=dtypes.int32, device=x.device)
   NO = N // 2 if glu is not None else N
   out = Tensor.invalids(Mp, NO, dtype=dtypes.half if glu is not None else dtypes.float32, device=x.device)
-  fxn = functools.partial(_mmq_program, cfg=MMQ, sp=sp, k=K, n=N, q6=q6, has_min=any(q == 12 for _, q, _ in segs), glu=glu)
-  out = Tensor.custom_kernel(out, xq, *wq, skws, flags, fxn=fxn)[0]
+  fxn = functools.partial(_mmq_program, cfg=MMQ, sp=sp, k=K, n=N, msegs=tuple(msegs), glu=glu)
+  out = Tensor.custom_kernel(out, xq, *wts, skws, flags, fxn=fxn)[0]
   if Mp != M: out = out[:M]
   out = out.reshape(*xs.shape[:-1], NO)
   return out if xs is x else out.shrink(tuple((0, s) for s in (*x.shape[:-1], NO)))

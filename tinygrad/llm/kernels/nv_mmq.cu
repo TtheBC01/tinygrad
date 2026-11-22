@@ -1,26 +1,19 @@
 // int8 tensor core GEMM for the LLM's prefill on GGUF quant weights (llama.cpp's "MMQ" idea) for Ampere (sm_80/86):
-// C[M,N] = X @ W^T with X quantized to int8 per 32 values along K (nv_quant.cu's QUANTIZE: per row K int8, then K/32 (d, d*sum))
-// and W as int8 [N][K] plus a float2 per 32-block (nv_quant.cu's REQUANT from Q4_K / Q6_K / Q8_0):
-//   Q8_0, Q4_K: (s, m), w = s*q - m (m = 0 for Q8_0)  ->  sum_k x w = dx*s*dot(qx, qw) - (dx*sum qx)*m
-//   Q6_K:       (s_lo, s_hi), one scale per 16 weights  ->  dx*(s_lo*dot_lo + s_hi*dot_hi)   (for tiles whose column bn is in
-//               a Q6_K segment: IS_Q6(bn), a condition nv.py defines)
-// On GA102 int8 mma runs at 4x the fp16-input/fp32-accumulate rate, and no fp16 copy of the weight is written.
-// The int8 fragments of mma.m16n8k32 have the same register layout as fp16 m16n8k16 ones over twice the bytes, so the tiles,
-// swizzle and ldmatrix loads are nv_gemm.cu's K-contiguous ones on bytes viewed as halves (BKH = 32 halves = 64 int8 = two quant
-// blocks per stage). After each block's mma the int32 dot is scaled into the fp32 accumulators.
+// C[M,N] = X @ W^T with X quantized to int8 per 32 values along K (nv_quant.cu's QUANTIZE: per row K int8, then K/32 (d, d*sum)).
+// W, per 32-block w = s*q - m (m = 0 for Q8_0 and Q6_K): sum_k x w = dx*s*dot(qx, qw) - (dx*sum qx)*m. The weights are read either
+// as the packed Q4_K / Q8_0 blocks themselves (decoded in the fragment loads: Q4_K nibbles with two ALU ops per register, the
+// 6-bit scales per warp column) or, for Q6_K, from nv_quant.cu's REQUANT int8 + float2 per block, with a scale per 16 (two k16 mmas).
+// On GA102 int8 mma runs at 4x the fp16-input/fp32-accumulate rate. The int8 fragments of mma.m16n8k32 have the same register
+// layout as fp16 m16n8k16 ones over twice the bytes, so the A tiles, swizzle and ldmatrix loads are nv_gemm.cu's K-contiguous ones
+// on bytes viewed as halves. After each block's mma the int32 dot is scaled into the fp32 accumulators.
 // Epilogue: fp32 C[M][N], or with GLU (columns interleaved (gate, up) pairs) half C[M][N/2] of their SwiGLU, as nv_gemm.cu.
-// nv.py prepends nv_common.cuh and #defines KNAME M_DIM N_DIM K_DIM BM BN WM WN STAGES GROUP_M SK_P IS_Q6(bn) HAS_MIN [GLU...].
+// nv.py prepends nv_common.cuh and #defines KNAME M_DIM N_DIM K_DIM BM BN WM WN STAGES NBLK GROUP_M SK_P [GLU...] and the segments:
+// SEG_PARAMS (their pointers) and SEG_RUN(k0, k1) (mainloop with the format and pointers of the segment that owns column bn).
 #ifndef GROUP_M
 #define GROUP_M 8
 #endif
 #ifndef SK_P
 #define SK_P 0
-#endif
-#ifndef HAS_MIN
-#define HAS_MIN 1
-#endif
-#ifndef IS_Q6
-#define IS_Q6(bn) false
 #endif
 #ifndef NBLK
 #define NBLK 2                 // quant blocks (32 int8 of K) per pipeline stage: 2 or 4
@@ -92,128 +85,235 @@ __device__ __forceinline__ void tile_coords(int t, int &bm, int &bn) {
 #endif
 }
 
-// X: [M][XROW] bytes. W: [N][K] int8. WS: [N][K/32] float2. smem per stage: A BM x 64 B, B BN x 64 B, then the stage's two blocks'
-// scales: A BM x 16 B, B BN x 16 B
-extern "C" __global__ void __launch_bounds__(NTHREADS)
-KNAME(out_t *__restrict__ C, const unsigned char *__restrict__ X, const unsigned char *__restrict__ W, const float2 *__restrict__ WS,
-      float *__restrict__ ws, int *__restrict__ flags) {
-  extern __shared__ __align__(128) unsigned char smem[];
-  half *As = (half *)smem, *Bs = As + STAGES * BM * BKH;
-  float2 *Asc = (float2 *)(Bs + STAGES * BN * BKH), *Bsc = Asc + STAGES * BM * NBLK;  // per row and block: (d, dsum) / (s, m)
+// B segment formats (uniform per tile; nv.py's SEG_RUN picks one per tile column bn):
+//   F_I8 / F_I8Q6: requantized int8 [N][K] + float2 [N][K/32] (REQUANT), the Q6 variant with two scales per block
+//   F_Q4K / F_Q8:  the packed GGUF blocks read as they are (+ F_IL: two weights' rows alternating, gate/up for GLU)
+#define F_I8 0
+#define F_I8Q6 1
+#define F_Q4K 2
+#define F_Q8 3
+#define F_IL 4
 
-  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int wm = warp / (BN / WN), wn = warp % (BN / WN);
-  int bm, bn;
+#ifndef BROW
+#define BROW 176  // B stage row stride in bytes: 176 with packed formats (44 words: the fragment loads' 8 rows hit distinct banks),
+#endif            // else KB + NBLK * 8 (requantized data + scales)
+#ifndef HAS_RAW
+#define HAS_RAW 1  // any packed-format segment: the per-warp decoded scales are allocated
+#endif
+static_assert(BROW >= KB + NBLK * 8 && BROW % 16 == 0, "a requantized row (data + scales) fits the B row stride");
+__device__ __forceinline__ void cp_async8(void *smem, const void *gmem) {
+  unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(s), "l"(gmem));
+}
+__device__ __forceinline__ unsigned lds32(const unsigned char *p) { return *(const unsigned *)p; }
+__device__ __forceinline__ unsigned lds16x2(const unsigned char *p) {  // 4 bytes at a 2-byte aligned address
+  return (unsigned)*(const unsigned short *)p | ((unsigned)*(const unsigned short *)(p + 2) << 16);
+}
+
+// X: [M][XROW] bytes. smem per stage: A BM x KB int8 (swizzled), B BN x BROW bytes (requantized: BN x KB swizzled int8, then BN x
+// NBLK float2; packed: each row's raw bytes for the stage), A scales BM x NBLK float2. Then per warp WN x NBLK float2 B scales
+// decoded from the packed headers.
+// The per-tile work is templated on the segment format F; St holds what the kernel's steps share (inlined: registers).
+struct St {
+  const unsigned char *X;
+  half *As;
+  unsigned char *Bs;
+  float2 *Asc, *wsc;
+  int tid, lane, wm, wn, bm, bn;
   float acc[MT][NT][4];
   unsigned af[2][MT][4], bf[2][NT][2];
+};
 
-  auto load_tile = [&](int stage, int kt) {
-    half *as = As + stage * BM * BKH, *bs = Bs + stage * BN * BKH;
+// wa/wb: the segment's pointers (requantized: int8 rows, float2 scales; packed: the blocks, and the second weight with F_IL),
+// nb: the tile's first row in the segment
+template <int F> __device__ __forceinline__ void load_tile(St &t, const unsigned char *wa, const void *wb, int nb, int stage, int kt) {
+  half *as = t.As + stage * BM * BKH;
+  unsigned char *bs = t.Bs + stage * BN * BROW;
 #pragma unroll
-    for (int i = 0; i < (BM * BKH / 8) / NTHREADS; i++) {
-      const int c = tid + i * NTHREADS, row = c / (BKH / 8), ch = c % (BKH / 8);
-      cp_async16(as + kc_off(row, ch), X + (size_t)(bm + row) * XROW + kt * KB + ch * 16);
-    }
+  for (int i = 0; i < (BM * BKH / 8) / NTHREADS; i++) {
+    const int c = t.tid + i * NTHREADS, row = c / (BKH / 8), ch = c % (BKH / 8);
+    cp_async16(as + kc_off(row, ch), t.X + (size_t)(t.bm + row) * XROW + kt * KB + ch * 16);
+  }
+  for (int c = t.tid; c < BM * (NBLK / 2); c += NTHREADS) {  // 16 bytes = two blocks' (d, dsum)
+    const int r = c / (NBLK / 2), h = c % (NBLK / 2);
+    cp_async16(t.Asc + (stage * BM + r) * NBLK + 2 * h, t.X + (size_t)(t.bm + r) * XROW + K_DIM + kt * NBLK * 8 + h * 16);
+  }
+  if constexpr ((F & 3) <= F_I8Q6) {
+    half *bh = (half *)bs;
 #pragma unroll
     for (int i = 0; i < (BN * BKH / 8) / NTHREADS; i++) {
-      const int c = tid + i * NTHREADS, row = c / (BKH / 8), ch = c % (BKH / 8);
-      cp_async16(bs + kc_off(row, ch), W + (size_t)(bn + row) * K_DIM + kt * KB + ch * 16);
+      const int c = t.tid + i * NTHREADS, row = c / (BKH / 8), ch = c % (BKH / 8);
+      cp_async16(bh + kc_off(row, ch), wa + (size_t)(nb + row) * K_DIM + kt * KB + ch * 16);
     }
-    for (int c = tid; c < (BM + BN) * (NBLK / 2); c += NTHREADS) {  // 16 bytes = two blocks' scales per copy
+    float2 *bsc = (float2 *)(bs + BN * KB);
+    for (int c = t.tid; c < BN * (NBLK / 2); c += NTHREADS) {
       const int r = c / (NBLK / 2), h = c % (NBLK / 2);
-      if (r < BM) cp_async16(Asc + (stage * BM + r) * NBLK + 2 * h, X + (size_t)(bm + r) * XROW + K_DIM + kt * NBLK * 8 + h * 16);
-      else cp_async16(Bsc + (stage * BN + r - BM) * NBLK + 2 * h, WS + (size_t)(bn + r - BM) * (K_DIM / 32) + kt * NBLK + 2 * h);
+      cp_async16(bsc + r * NBLK + 2 * h, (const float2 *)wb + (size_t)(nb + r) * (K_DIM / 32) + kt * NBLK + 2 * h);
     }
-  };
-  auto load_frags = [&](int buf, int stage, int kk) {
-    const half *as = As + stage * BM * BKH, *bs = Bs + stage * BN * BKH;
+  } else {
+    static_assert(NBLK == 4, "packed formats: a stage is half a Q4_K superblock / four Q8_0 blocks");
+    constexpr size_t RB = (F & 3) == F_Q4K ? K_DIM / 256 * 144 : K_DIM / 32 * 34;  // bytes per packed row
+    if constexpr ((F & 3) == F_Q4K) {  // header (d, dmin, scales) and this half's 64 nibble bytes: 5 x 16 bytes per row
+      for (int c = t.tid; c < BN * 5; c += NTHREADS) {
+        const int r = c / 5, j = c % 5;
+        const unsigned char *rp = (F & F_IL) ? ((r & 1) ? (const unsigned char *)wb : wa) + (size_t)((nb + r) >> 1) * RB : wa + (size_t)(nb + r) * RB;
+        cp_async16(bs + r * BROW + 16 * j, rp + (size_t)(kt >> 1) * 144 + (j ? 16 + 64 * (kt & 1) + 16 * (j - 1) : 0));
+      }
+    } else {  // four 34-byte blocks, 8-byte aligned: 17 x 8 bytes per row
+      for (int c = t.tid; c < BN * 17; c += NTHREADS) {
+        const int r = c / 17, j = c % 17;
+        const unsigned char *rp = (F & F_IL) ? ((r & 1) ? (const unsigned char *)wb : wa) + (size_t)((nb + r) >> 1) * RB : wa + (size_t)(nb + r) * RB;
+        cp_async8(bs + r * BROW + 8 * j, rp + (size_t)kt * 136 + 8 * j);
+      }
+    }
+  }
+}
+// after a stage has landed: each lane decodes its column's scales for the stage's blocks (packed formats)
+template <int F> __device__ __forceinline__ void decode_scales(St &t, int stage, int kt) {
+  if constexpr ((F & 3) >= F_Q4K) {
+    const unsigned char *b = t.Bs + stage * BN * BROW + (t.wn * WN + t.lane) * BROW;
 #pragma unroll
-    for (int mt = 0; mt < MT; mt++) ldmatrix_x4(af[buf][mt], as + kc_off(wm * WM + mt * 16 + (lane & 15), kk * 2 + (lane >> 4)));
+    for (int g = 0; g < WN / 32; g++, b += 32 * BROW) {
+      if constexpr ((F & 3) == F_Q4K) {
+        const float d = __half2float(*(const half *)b), dmin = __half2float(*(const half *)(b + 2));
+        const unsigned char *sc = b + 4;
+#pragma unroll
+        for (int kk = 0; kk < NBLK; kk++) {
+          const int j = 4 * (kt & 1) + kk;
+          const int sj = j < 4 ? sc[j] & 63 : (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4);
+          const int mj = j < 4 ? sc[j + 4] & 63 : (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+          t.wsc[(g * 32 + t.lane) * NBLK + kk] = make_float2(d * sj, dmin * mj);
+        }
+      } else {
+#pragma unroll
+        for (int kk = 0; kk < NBLK; kk++) t.wsc[(g * 32 + t.lane) * NBLK + kk] = make_float2(__half2float(*(const half *)(b + 34 * kk)), 0.0f);
+      }
+    }
+    __syncwarp();
+  }
+}
+template <int F> __device__ __forceinline__ void load_frags(St &t, int buf, int stage, int kk) {
+  const half *as = t.As + stage * BM * BKH;
+  const unsigned char *bs = t.Bs + stage * BN * BROW;
+  const int lane = t.lane;
+#pragma unroll
+  for (int mt = 0; mt < MT; mt++) ldmatrix_x4(t.af[buf][mt], as + kc_off(t.wm * WM + mt * 16 + (lane & 15), kk * 2 + (lane >> 4)));
+  if constexpr ((F & 3) <= F_I8Q6) {
 #pragma unroll
     for (int nt = 0; nt < NT; nt += 2) {
       unsigned r[4];
-      ldmatrix_x4(r, bs + kc_off(wn * WN + nt * 8 + ((lane >> 4) << 3) + (lane & 7), kk * 2 + ((lane >> 3) & 1)));
-      bf[buf][nt][0] = r[0]; bf[buf][nt][1] = r[1]; bf[buf][nt + 1][0] = r[2]; bf[buf][nt + 1][1] = r[3];
+      ldmatrix_x4(r, (const half *)bs + kc_off(t.wn * WN + nt * 8 + ((lane >> 4) << 3) + (lane & 7), kk * 2 + ((lane >> 3) & 1)));
+      t.bf[buf][nt][0] = r[0]; t.bf[buf][nt][1] = r[1]; t.bf[buf][nt + 1][0] = r[2]; t.bf[buf][nt + 1][1] = r[3];
     }
-  };
-  // one 32-wide quant block (kk of the stage): int8 mma, then scale into acc
-  auto block = [&](int buf, int stage, int kk, bool q6) {
-    const float2 *asc = Asc + stage * BM * NBLK + kk, *bsc = Bsc + stage * BN * NBLK + kk;
-    const unsigned (&a)[MT][4] = af[buf];
-    const unsigned (&bb)[NT][2] = bf[buf];
-    float2 xs[MT][2];
-#pragma unroll
-    for (int mt = 0; mt < MT; mt++)
-#pragma unroll
-      for (int h = 0; h < 2; h++) xs[mt][h] = asc[NBLK * (wm * WM + mt * 16 + (lane >> 2) + 8 * h)];
+  } else {
 #pragma unroll
     for (int nt = 0; nt < NT; nt++) {
-      const float2 w0 = bsc[NBLK * (wn * WN + nt * 8 + (lane & 3) * 2)], w1 = bsc[NBLK * (wn * WN + nt * 8 + (lane & 3) * 2 + 1)];
+      const unsigned char *row = bs + (t.wn * WN + nt * 8 + (lane >> 2)) * BROW;
+      if constexpr ((F & 3) == F_Q4K) {  // block kk = nibbles (kk & 1) of qs chunk kk / 2: bytes 4 (lane & 3) .. and +16
+        const unsigned char *q = row + 16 + 32 * (kk >> 1) + 4 * (lane & 3);
+        t.bf[buf][nt][0] = (lds32(q) >> (4 * (kk & 1))) & 0x0F0F0F0F;
+        t.bf[buf][nt][1] = (lds32(q + 16) >> (4 * (kk & 1))) & 0x0F0F0F0F;
+      } else {
+        const unsigned char *q = row + 34 * kk + 2 + 4 * (lane & 3);
+        t.bf[buf][nt][0] = lds16x2(q);
+        t.bf[buf][nt][1] = lds16x2(q + 16);
+      }
+    }
+  }
+}
+// one 32-wide quant block (kk of the stage): int8 mma, then scale into acc
+template <int F> __device__ __forceinline__ void block(St &t, int buf, int stage, int kk) {
+  const int lane = t.lane;
+  const float2 *asc = t.Asc + stage * BM * NBLK + kk;
+  const float2 *bsc = (F & 3) <= F_I8Q6 ? (const float2 *)(t.Bs + stage * BN * BROW + BN * KB) + t.wn * WN * NBLK + kk : t.wsc + kk;
+  float2 xs[MT][2];
 #pragma unroll
-      for (int mt = 0; mt < MT; mt++) {
-        if (!q6) {
-          int c[4];
-          mma_s8_k32(c, a[mt], bb[nt]);
+  for (int mt = 0; mt < MT; mt++)
 #pragma unroll
-          for (int e = 0; e < 4; e++) {
-            const float2 x = xs[mt][e >> 1], w = (e & 1) ? w1 : w0;
-#if HAS_MIN
-            acc[mt][nt][e] = fmaf(i2f(c[e]), x.x * w.x, fmaf(-x.y, w.y, acc[mt][nt][e]));
-#else
-            acc[mt][nt][e] = fmaf(i2f(c[e]), x.x * w.x, acc[mt][nt][e]);
-#endif
-          }
-        } else {
-          int lo[4], hi[4];
-          mma_s8_k16(lo, a[mt][0], a[mt][1], bb[nt][0]);
-          mma_s8_k16(hi, a[mt][2], a[mt][3], bb[nt][1]);
+    for (int h = 0; h < 2; h++) xs[mt][h] = asc[NBLK * (t.wm * WM + mt * 16 + (lane >> 2) + 8 * h)];
 #pragma unroll
-          for (int e = 0; e < 4; e++) {
-            const float2 x = xs[mt][e >> 1], w = (e & 1) ? w1 : w0;
-            acc[mt][nt][e] = fmaf(x.x, fmaf(i2f(lo[e]), w.x, i2f(hi[e]) * w.y), acc[mt][nt][e]);
-          }
+  for (int nt = 0; nt < NT; nt++) {
+    const float2 w0 = bsc[NBLK * (nt * 8 + (lane & 3) * 2)], w1 = bsc[NBLK * (nt * 8 + (lane & 3) * 2 + 1)];
+#pragma unroll
+    for (int mt = 0; mt < MT; mt++) {
+      if constexpr (F != F_I8Q6) {
+        int c[4];
+        mma_s8_k32(c, t.af[buf][mt], t.bf[buf][nt]);
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+          const float2 x = xs[mt][e >> 1], w = (e & 1) ? w1 : w0;
+          if constexpr ((F & 3) == F_Q8) t.acc[mt][nt][e] = fmaf(i2f(c[e]), x.x * w.x, t.acc[mt][nt][e]);
+          else t.acc[mt][nt][e] = fmaf(i2f(c[e]), x.x * w.x, fmaf(-x.y, w.y, t.acc[mt][nt][e]));
+        }
+      } else {
+        // each half's dot is scaled as soon as it's out: 4 live int32s instead of 8 (the two at once spilled)
+        int c[4];
+        mma_s8_k16(c, t.af[buf][mt][0], t.af[buf][mt][1], t.bf[buf][nt][0]);
+#pragma unroll
+        for (int e = 0; e < 4; e++) t.acc[mt][nt][e] = fmaf(i2f(c[e]), xs[mt][e >> 1].x * ((e & 1) ? w1 : w0).x, t.acc[mt][nt][e]);
+        mma_s8_k16(c, t.af[buf][mt][2], t.af[buf][mt][3], t.bf[buf][nt][1]);
+#pragma unroll
+        for (int e = 0; e < 4; e++) t.acc[mt][nt][e] = fmaf(i2f(c[e]), xs[mt][e >> 1].x * ((e & 1) ? w1 : w0).y, t.acc[mt][nt][e]);
+      }
+    }
+  }
+}
+template <int F> __device__ __forceinline__ void mainloop(St &t, const unsigned char *wa, const void *wb, int nb, int k0, int k1) {
+#pragma unroll
+  for (int i = 0; i < MT; i++)
+#pragma unroll
+    for (int j = 0; j < NT; j++)
+#pragma unroll
+      for (int k = 0; k < 4; k++) t.acc[i][j][k] = 0.0f;
+  const int n = k1 - k0;
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; s++) {
+    if (s < n) load_tile<F>(t, wa, wb, nb, s, k0 + s);
+    cp_async_commit();
+  }
+  cp_async_wait<STAGES - 2>();  // tile 0 has landed
+  __syncthreads();
+  decode_scales<F>(t, 0, k0);
+  load_frags<F>(t, 0, 0, 0);
+  for (int i = 0; i < n; i++) {
+    // slot (i-1)%STAGES was last read before the barrier at the end of iteration i-1, so it's free to overwrite
+    const int ni = i + STAGES - 1;
+    if (ni < n) load_tile<F>(t, wa, wb, nb, ni % STAGES, k0 + ni);
+    cp_async_commit();
+#pragma unroll
+    for (int kk = 0; kk < NBLK; kk++) {
+      if (kk < NBLK - 1) {  // the next block's fragments load while this block's mmas run
+        load_frags<F>(t, (kk + 1) & 1, i % STAGES, kk + 1);
+        block<F>(t, kk & 1, i % STAGES, kk);
+      } else {  // the last block reads this stage's scales, so it runs before the barrier that frees the stage
+        block<F>(t, kk & 1, i % STAGES, kk);
+        cp_async_wait<STAGES - 2>();  // tile i+1 has landed
+        __syncthreads();              // and every warp is done with stage i
+        if (i + 1 < n) {
+          decode_scales<F>(t, (i + 1) % STAGES, k0 + i + 1);
+          load_frags<F>(t, 0, (i + 1) % STAGES, 0);
         }
       }
     }
-  };
+  }
+  __syncthreads();
+}
 
-  auto mainloop = [&](int k0, int k1) {
-#pragma unroll
-    for (int i = 0; i < MT; i++)
-#pragma unroll
-      for (int j = 0; j < NT; j++)
-#pragma unroll
-        for (int k = 0; k < 4; k++) acc[i][j][k] = 0.0f;
-    const bool q6 = IS_Q6(bn);
-    const int n = k1 - k0;
-#pragma unroll
-    for (int s = 0; s < STAGES - 1; s++) {
-      if (s < n) load_tile(s, k0 + s);
-      cp_async_commit();
-    }
-    cp_async_wait<STAGES - 2>();  // tile 0 has landed
-    __syncthreads();
-    load_frags(0, 0, 0);
-    for (int i = 0; i < n; i++) {
-      // slot (i-1)%STAGES was last read before the barrier at the end of iteration i-1, so it's free to overwrite
-      const int ni = i + STAGES - 1;
-      if (ni < n) load_tile(ni % STAGES, k0 + ni);
-      cp_async_commit();
-#pragma unroll
-      for (int kk = 0; kk < NBLK; kk++) {
-        if (kk < NBLK - 1) {  // the next block's fragments load while this block's mmas run
-          load_frags((kk + 1) & 1, i % STAGES, kk + 1);
-          block(kk & 1, i % STAGES, kk, q6);
-        } else {  // the last block reads this stage's scales, so it runs before the barrier that frees the stage
-          block(kk & 1, i % STAGES, kk, q6);
-          cp_async_wait<STAGES - 2>();  // tile i+1 has landed
-          __syncthreads();              // and every warp is done with stage i
-          if (i + 1 < n) load_frags(0, (i + 1) % STAGES, 0);
-        }
-      }
-    }
-    __syncthreads();
-  };
+
+extern "C" __global__ void __launch_bounds__(NTHREADS)
+KNAME(out_t *__restrict__ C, const unsigned char *__restrict__ X, SEG_PARAMS, float *__restrict__ ws, int *__restrict__ flags) {
+  extern __shared__ __align__(128) unsigned char smem[];
+  St t;
+  t.X = X;
+  t.As = (half *)smem;
+  t.Bs = (unsigned char *)(t.As + STAGES * BM * BKH);
+  t.Asc = (float2 *)(t.Bs + STAGES * BN * BROW);
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  t.tid = tid, t.lane = lane, t.wm = warp / (BN / WN), t.wn = warp % (BN / WN);
+  t.wsc = t.Asc + STAGES * BM * NBLK + warp * WN * NBLK;  // this warp's decoded B scales: [WN][NBLK]
+  int &bm = t.bm, &bn = t.bn;
+  const int wm = t.wm, wn = t.wn;
+  float (&acc)[MT][NT][4] = t.acc;
 
   auto store_tile = [&]() {
 #pragma unroll
@@ -238,7 +338,7 @@ KNAME(out_t *__restrict__ C, const unsigned char *__restrict__ X, const unsigned
   const int pid = blockIdx.x;
   if (pid >= SK_WORKERS) {
     tile_coords(SK_TILES + pid - SK_WORKERS, bm, bn);
-    mainloop(0, KT);
+    SEG_RUN(0, KT)
     store_tile();
     return;
   }
@@ -247,9 +347,9 @@ KNAME(out_t *__restrict__ C, const unsigned char *__restrict__ X, const unsigned
   auto it_begin = [](int w) { return (int)(SK_ITERS * w / SK_WORKERS); };
   const int end = it_begin(pid + 1);
   for (int it = it_begin(pid); it < end;) {
-    const int t = it / KT, k0 = it % KT, k1 = min(KT, k0 + end - it);
-    tile_coords(t, bm, bn);
-    mainloop(k0, k1);
+    const int tl = it / KT, k0 = it % KT, k1 = min(KT, k0 + end - it);
+    tile_coords(tl, bm, bn);
+    SEG_RUN(k0, k1)
     if (k0 != 0) {
       float4 *dst = (float4 *)(ws + (size_t)pid * BM * BN);
 #pragma unroll
@@ -261,7 +361,7 @@ KNAME(out_t *__restrict__ C, const unsigned char *__restrict__ X, const unsigned
       __syncthreads();
       if (tid == 0) st_release(&flags[pid], 1);
     } else {
-      for (int w = pid + 1; w < SK_WORKERS && it_begin(w) < (t + 1) * KT; w++) {
+      for (int w = pid + 1; w < SK_WORKERS && it_begin(w) < (tl + 1) * KT; w++) {
         if (tid == 0) {
           while (ld_acquire(&flags[w]) == 0) __nanosleep(64);
           flags[w] = 0;

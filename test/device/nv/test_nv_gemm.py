@@ -346,8 +346,9 @@ class TestNVQuant(unittest.TestCase):
         if tokens == 512:
           names = [u.src[0].src[0].arg.name for u in Tensor.schedule_linear(*fused_linear(Tensor(x).realize(), *lins)).src
                    if u.src[0].op is Ops.PROGRAM]
-          self.assertTrue(any(n.startswith("nv_q12x14x8_requant") for n in names) and any(n.startswith("nv_mmq_512_512_1024") for n in names),
-                          names)
+          # Q4_K and Q8_0 read as packed blocks, Q6_K requantized
+          self.assertTrue(any(n.startswith("nv_q14_requant_128_1024") for n in names) and
+                          any(n.startswith("nv_mmq_512_512_1024") and n.endswith("_r12xi6xr8") for n in names), names)
         for lin, out in zip(lins, fused_linear(Tensor(x), *lins)):
           ref = x @ lin.weight.float().numpy().T
           np.testing.assert_allclose(out.numpy(), ref, atol=0.02 * np.abs(ref).max(), rtol=0)
