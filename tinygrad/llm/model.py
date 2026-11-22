@@ -3,6 +3,7 @@ import array, enum, functools, itertools, json, math, pathlib, re
 from dataclasses import dataclass, replace
 from typing import Any, Callable, cast
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
+from tinygrad.engine.jit import ScratchPool
 from tinygrad.device import Buffer
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.amd import RMSNorm, fused_linear, glu_ffn, residual_add
@@ -834,7 +835,9 @@ class Transformer:
     self._position_count: int|None = None
     # we specialize the JIT for prefill and rollout, and speculative decoding's verification (a static token count)
     self.prefill_jits:dict[tuple[int, bool], Any] = {}  # TinyJit per chunk size (the token count's max) and prompt-buffer input
-    self.rollout_jit = TinyJit(self.forward)
+    # all of the model's JITs run one at a time: they share one scratch arena (the largest one's) instead of one each
+    self.scratch = ScratchPool()
+    self.rollout_jit = TinyJit(self.forward, scratch=self.scratch)
     self.verify_jits:dict[int, Any] = {}  # TinyJit per token count
     self._spec_state:dict[tuple[int, int, bool], Any] = {}  # generate_speculative's JITs and buffers per draft, k and sampling
     # speculative decoding: with a draft model set, generate() runs generate_speculative with draft_k proposals per round
@@ -856,7 +859,7 @@ class Transformer:
     return self.output(self.output_norm(self._trunk(tokens, start_pos))).argmax(-1).to(tokens.device)
 
   def verify(self, tokens:Tensor, start_pos:UOp) -> Tensor:
-    if (jit:=self.verify_jits.get(T:=int(tokens.shape[1]))) is None: jit = self.verify_jits[T] = TinyJit(self.forward_verify)
+    if (jit:=self.verify_jits.get(T:=int(tokens.shape[1]))) is None: jit = self.verify_jits[T] = TinyJit(self.forward_verify, scratch=self.scratch)
     return jit(tokens.contiguous(), start_pos)
 
   def last_logits(self, tokens:Tensor, *start_pos:int|UOp) -> Tensor:
@@ -875,7 +878,8 @@ class Transformer:
     # a chunk of generate()'s prompt buffer goes in as a view (contiguous() would realize a copy eagerly), in its own JIT
     view = (pb:=getattr(self, "_prompt_buf", None)) is not None and tokens.uop.base is pb.uop.base
     if resolve(tokens.shape[1] != 1):
-      if (jit:=self.prefill_jits.get(key:=(int(tokens.max_shape[1]), view))) is None: jit = self.prefill_jits[key] = TinyJit(self.forward)
+      if (jit:=self.prefill_jits.get(key:=(int(tokens.max_shape[1]), view))) is None:
+        jit = self.prefill_jits[key] = TinyJit(self.forward, scratch=self.scratch)
     else: jit = self.rollout_jit
     return jit(tokens if view else tokens.contiguous(), temperature, *positions)
 
@@ -1211,7 +1215,8 @@ class Transformer:
     yield tokens[-1]
     if (st:=self._spec_state.get(key:=(id(draft), k, sampled))) is None:  # JITs and buffers for this draft, k and greedy or sampled
       step, check = (draft._spec_draft_sampled, self._spec_verify_sampled) if sampled else (draft._spec_draft, self._spec_verify)
-      st = self._spec_state[key] = ((TinyJit(step), TinyJit(step), TinyJit(check)), Tensor.zeros(1, k, dtype=dtypes.int32).contiguous().realize(),
+      jits = (TinyJit(step, scratch=self.scratch), TinyJit(step, scratch=self.scratch), TinyJit(check, scratch=self.scratch))
+      st = self._spec_state[key] = (jits, Tensor.zeros(1, k, dtype=dtypes.int32).contiguous().realize(),
                                     Tensor.zeros(1, k, self.config.vocab_size).contiguous().realize() if sampled else None)
     (first, nxt, verify), props, qs = st
     # the inputs after the tokens: the draft's step (props, [qs,] temp), the check (props[, qs, temp])
