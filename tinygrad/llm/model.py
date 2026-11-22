@@ -11,6 +11,17 @@ from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
 from tinygrad.helpers import unwrap, round_up, ceildiv, get_child
 
+# generate()'s prefill chunk sizes. A symbolic chunk runs padded to its size and each size has its own prefill JIT; state sized by
+# the chunk is sized for the largest. The largest size runs while that much is left, the rest takes the cheapest split with each
+# chunk costing PREFILL_CHUNK_COST + its size (in tokens: per-chunk work that doesn't scale with the tokens, ~70 on 8B NV).
+# Each JIT has its own scratch buffers (~0.1 GB per size on 8B Q4_K_M), PREFILL_CHUNKS=32,512 trades speed for less of it.
+PREFILL_CHUNKS = tuple(sorted(int(c) for c in getenv("PREFILL_CHUNKS", "32,64,128,256,512").split(",")))
+PREFILL_CHUNK_COST = 64
+@functools.cache
+def _chunk_plan(sizes:tuple[int, ...], left:int) -> tuple[int, int]:  # (cost, first chunk) of the cheapest split of left tokens
+  return (0, 0) if left <= 0 else min((PREFILL_CHUNK_COST + c + _chunk_plan(sizes, left - c)[0], c) for c in sizes)
+def chunk_room(x:Tensor) -> int: return max(int(x.max_shape[1]), PREFILL_CHUNKS[-1])
+
 StartPos = tuple[int|UOp, ...]
 
 class ExpertGating(enum.IntEnum):
@@ -443,7 +454,7 @@ class TransformerBlock(FFNBlock):
                                    dtype=dtypes.half, device=x.device if isinstance(x.device, str) else None)
       if isinstance(x.device, tuple): self.cache_kv = self.cache_kv.shard(x.device, 2).realize()
       # start_pos and T have independent symbolic bounds, the slice can overrun the context by all but one of T
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context + x.max_shape[1]-1, self.config.rope_theta,
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context + chunk_room(x)-1, self.config.rope_theta,
                                             device=x.device, yarn=self.config.yarn)
     if self.indexer: self.indexer._init_state(x)
 
@@ -543,7 +554,7 @@ class Compressor:
     if not hasattr(self, "cache_pools"):
       self.cache_kg = Tensor.empty(x.shape[0], self.ratio * self.span, 2, self.dim * self.span, device=x.device)
       # zeroed: a NaN in the masked incomplete pools would still poison the attention
-      self.cache_pools = Tensor.zeros(x.shape[0], ceildiv(self.max_context + x.max_shape[1], self.ratio) + 2, self.dim,
+      self.cache_pools = Tensor.zeros(x.shape[0], ceildiv(self.max_context + chunk_room(x), self.ratio) + 2, self.dim,
                                       dtype=dtypes.half, device=x.device).clone()
 
   def __call__(self, x:Tensor, start_pos:StartPos, freqs:Tensor) -> Tensor:
@@ -668,7 +679,7 @@ class CompressedAttentionBlock(FFNBlock):
     if not hasattr(self, "cache_kv"):
       R, (theta, yarn) = max((cfg:=self.config).compress_ratios), (cfg.compress_rope_theta, cfg.yarn) if self.ratio else (cfg.rope_theta, None)
       self.cache_kv = Tensor.empty(x.shape[0], cfg.sliding_window, cfg.head_dim, dtype=dtypes.half, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(cfg.rope_dim, round_up(cfg.max_context + x.max_shape[1], R) + 2*R, theta, device=x.device, yarn=yarn)
+      self.freqs_cis = precompute_freqs_cis(cfg.rope_dim, round_up(cfg.max_context + chunk_room(x), R) + 2*R, theta, device=x.device, yarn=yarn)
     if self.ratio: self.attn_compressor._init_state(x)
     if self.indexer: self.indexer._init_state(x)
 
@@ -798,7 +809,7 @@ class Transformer:
     self._cached_tokens: list[int] = []
     self._position_count: int|None = None
     # we specialize the JIT for prefill and rollout, and speculative decoding's verification (a static token count)
-    self.prefill_jit = TinyJit(self.forward)
+    self.prefill_jits:dict[int, Any] = {}  # TinyJit per chunk size (the symbolic token count's max)
     self.rollout_jit = TinyJit(self.forward)
     self.verify_jits:dict[int, Any] = {}  # TinyJit per token count
     # speculative decoding: with a draft model set, greedy generate() runs generate_speculative with draft_k proposals per round
@@ -835,7 +846,10 @@ class Transformer:
     if self._position_count is None: self._position_count = len(start_pos)
     assert len(start_pos) == self._position_count, "position count is fixed for this model"
     positions = tuple(UOp.variable(f"start_pos_{b}", 0, self.max_context-1).bind(p) if isinstance(p, int) else p for b, p in enumerate(start_pos))
-    return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), temperature, *positions)
+    if resolve(tokens.shape[1] != 1):
+      if (jit:=self.prefill_jits.get(T:=int(tokens.max_shape[1]))) is None: jit = self.prefill_jits[T] = TinyJit(self.forward)
+    else: jit = self.rollout_jit
+    return jit(tokens.contiguous(), temperature, *positions)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -1075,6 +1089,22 @@ class Transformer:
 
   def warmup(self):
     for _ in range(2): list(zip(range(2), self.generate([0])))
+    # the larger prefill chunk sizes have their own JITs: capture each on a prompt that runs it once
+    for c in list(self._prefill_tiers(None))[1:]:
+      for _ in range(2):
+        self._cached_tokens = []
+        list(zip(range(1), self.generate([0] * c)))
+    self._cached_tokens = []
+
+  def _prefill_tiers(self, chunk_size:int|None) -> dict[int, UOp]:
+    # chunk size -> its symbolic token count (see PREFILL_CHUNKS); a given chunk_size is the only one
+    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): sizes:tuple[int, ...] = (1,)
+    elif chunk_size is not None: sizes = (chunk_size,)
+    else: sizes = tuple(c for c in PREFILL_CHUNKS if c == PREFILL_CHUNKS[0] or c < self.max_context)
+    return {c: UOp.variable("toks", 1, c) for c in sizes}
+
+  @staticmethod
+  def _chunk(sizes, left:int) -> int: return max(sizes) if left >= max(sizes) else _chunk_plan(tuple(sorted(sizes)), left)[1]
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -1098,21 +1128,21 @@ class Transformer:
     n = (g[:, :k] == props).cast(dtypes.int32).cumprod(1).sum(1, keepdim=True)
     return g.cat((n + 1).minimum(k), dim=1)
 
-  def generate_speculative(self, draft:Transformer, tokens:list[int], k:int=4, chunk_size:int=32):
+  def generate_speculative(self, draft:Transformer, tokens:list[int], k:int=4, chunk_size:int|None=None):
     """Greedy generation (temperature 0) with speculative decoding: draft (a small model with the same tokenizer) proposes k tokens
     one at a time, this model checks them in one forward over k+1 tokens and keeps the drafted tokens it agrees with plus its own
     next token, so the output is this model's greedy output while its weights are read once per round. Each round stays on the GPU
     (the draft's steps and the check are JITs that pass tokens through device buffers); one readback per round."""
     assert self.max_context <= draft.max_context and not self.has_recurrent_block and not draft.has_recurrent_block and k >= 1
     temp = Tensor([0.0]).realize()
-    v_pos, v_toks = UOp.variable("start_pos", 0, self.max_context-1), UOp.variable("toks", 1, chunk_size)
+    v_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_j, v_i = UOp.variable("spec_j", 0, k), UOp.variable("spec_i", 0, k-1)
     def prefill(m:Transformer, toks:list[int], start:int) -> int:  # process toks[start:], return the next token
       t = Tensor(toks + [0] * (m.max_context - len(toks)), dtype="int32").reshape(1, m.max_context)
-      out = None
+      out, tiers = None, m._prefill_tiers(chunk_size)
       while start < len(toks):
-        n = min(chunk_size, len(toks) - start)
-        out = m(t[:, v_pos.bind(start):v_pos.bind(start)+v_toks.bind(n)], (v_pos.bind(start),), temp).realize()
+        n = min(c:=m._chunk(tiers, len(toks) - start), len(toks) - start)
+        out = m(t[:, v_pos.bind(start):v_pos.bind(start)+tiers[c].bind(n)], (v_pos.bind(start),), temp).realize()
         start += n
       return int(unwrap(out).item())
     start = min(self.get_start_pos(tokens), draft.get_start_pos(tokens))
@@ -1139,13 +1169,13 @@ class Transformer:
         yield tk
       j, pos = m - 1, pos + m
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0):
+    # chunk_size: one fixed prefill chunk size instead of PREFILL_CHUNKS
     if self.draft is not None and temperature == 0.0:
       yield from self.generate_speculative(self.draft, tokens, self.draft_k, chunk_size)
       return
-    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+    tiers = self._prefill_tiers(chunk_size)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
-    v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor([temperature])
     # assign all input tokens once, then slice from start_pos for the model call
@@ -1154,9 +1184,9 @@ class Transformer:
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
-      if self.config.ple: self.blk[self.config.ple.layer].ple.write_rows(tokens, start_pos, n_toks, chunk_size)
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+      n_toks = min(c:=self._chunk(tiers, len(tokens) - start_pos), len(tokens) - start_pos)
+      if self.config.ple: self.blk[self.config.ple.layer].ple.write_rows(tokens, start_pos, n_toks, max(tiers))
+      sp, nt = v_start_pos.bind(start_pos), tiers[c].bind(n_toks)
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, (sp,), temp).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed

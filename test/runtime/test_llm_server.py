@@ -153,6 +153,36 @@ class TestTransformerGenerate(unittest.TestCase):
     # 4 tokens, chunk_size=4 -> 1 prefill chunk
     self.assertEqual(get_prefill_flags(list(range(4)), 4), [True, False, False])
 
+  def test_default_chunk_sizes(self):
+    # without a chunk_size the prompt is split over PREFILL_CHUNKS (each size its own symbolic range and prefill JIT)
+    from dataclasses import replace
+    model = Transformer(replace(TEST_CONFIG, max_context=1200))
+    def chunks(n):
+      sizes = []
+      def mock_call(self, tokens, start_pos, temperature, **kwargs):
+        sizes.append(tokens.max_shape[1])
+        return Tensor([[42]])
+      with patch.object(Transformer, '__call__', mock_call): next(model.generate(list(range(n))))
+      model._cached_tokens = []
+      return sizes
+    self.assertEqual(chunks(5), [32])
+    self.assertEqual(chunks(50), [64])
+    self.assertEqual(chunks(200), [256])
+    self.assertEqual(chunks(300), [64, 256])
+    self.assertEqual(chunks(1100), [512, 512, 128])
+    self.assertEqual(Transformer(replace(TEST_CONFIG, max_context=100))._prefill_tiers(None).keys(), {32, 64})
+
+  def test_default_chunks_match_fixed(self):
+    # a prompt over several chunk sizes gives the same greedy output as fixed 32-token chunks (fresh state and JITs each)
+    from dataclasses import replace
+    def run(chunk_size):
+      model = Transformer(replace(TEST_CONFIG, max_context=256))
+      rng = np.random.RandomState(1234)
+      for t in get_state_dict(model).values(): t.assign(Tensor(rng.uniform(-0.5, 0.5, t.shape).astype(np.float32))).realize()
+      gen = model.generate([i % 97 + 1 for i in range(100)], chunk_size=chunk_size)
+      return [next(gen) for _ in range(4)]
+    self.assertEqual(run(None), run(32))
+
   def test_chunked_prefill_kv_cache_matches_single_chunk(self):
     config = TransformerConfig(num_blocks=1, dim=8, hidden_dim=16, n_heads=1, n_kv_heads=1, norm_eps=1e-5,
       vocab_size=32, head_dim=4, rope_theta=1000000, rope_dim=4, qk_norm=4, v_head_dim=4, max_context=16)
