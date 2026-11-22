@@ -5,8 +5,10 @@
 // before any is used: enough bytes in flight to stream the cache (one key per warp at a time was latency bound, ~300 GB/s).
 // The G = NH/NKV query heads of a KV head share each K/V row read (GQA).
 // NT query tokens per sequence (speculative decoding's check): token t sits at position valid_end - NT + t and sees the keys before
-// it and itself, each (sequence, token) its own row of splits. nv.py prepends nv_common.cuh and nv_decode_merge.cuh and #defines
-// PARTIAL or COMBINE, KNAME NB NT NH NKV NCTX HD NSPLIT NWARPS UNR MINKEYS.
+// it and itself, each (sequence, token) its own row of splits. Sequences have their own lengths (batched decode: params[b] is
+// sequence b's valid_end) and sit in cache row params[NB + b] of the cache's NBK rows (a slot of a batched cache).
+// nv.py prepends nv_common.cuh and nv_decode_merge.cuh and #defines PARTIAL or COMBINE, KNAME NB NBK NT NH NKV NCTX HD NSPLIT NWARPS
+// UNR MINKEYS.
 
 #define G (NH / NKV)
 #define LPK (HD / 8)             // lanes per key
@@ -25,13 +27,13 @@ __device__ __forceinline__ void load8(float (&f)[8], const half *p) {  // 8 cons
 #ifdef PARTIAL
 static_assert(sizeof(float) * NWARPS * G * (HD + 2) <= 48 * 1024, "too many query heads per KV head for shared memory");
 // grid (NSPLIT, NB * NT * NKV), NWARPS * 32 threads. P: [NB * NT][NH][NSPLIT][PSTRIDE] fp32 (only the non-empty splits are written).
-// Q: [NB * NT][NH][HD] fp16. params[0] = valid_end.
+// Q: [NB * NT][NH][HD] fp16. params: [NB] valid_end per sequence, then [NB] cache row per sequence.
 extern "C" __global__ void __launch_bounds__(32 * NWARPS)
 KNAME(float *__restrict__ P, const half *__restrict__ Q, const half *__restrict__ KV, const int *__restrict__ params) {
   __shared__ float sm_m[NWARPS][G], sm_l[NWARPS][G], sm_o[NWARPS][G][HD];
   const int split = blockIdx.x, bt = blockIdx.y / NKV, b = bt / NT, kvh = blockIdx.y % NKV, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int sub = lane / LPK, dl = lane % LPK;  // which of the warp's keys, which 8 dims
-  const int valid_end = params[0] - NT + 1 + bt % NT;  // this token's keys
+  const int valid_end = params[b] - NT + 1 + bt % NT, row = params[NB + b];  // this token's keys, its cache row
   float q[G][8], o[G][8], m[G], l[G];
 #pragma unroll
   for (int g = 0; g < G; g++) load8(q[g], Q + ((size_t)bt * NH + kvh * G + g) * HD + dl * 8);  // in flight with params
@@ -44,8 +46,8 @@ KNAME(float *__restrict__ P, const half *__restrict__ Q, const half *__restrict_
     for (int i = 0; i < 8; i++) q[g][i] *= scale, o[g][i] = 0.0f;
     m[g] = NEG_INF, l[g] = 0.0f;
   }
-  const half *kp = KV + ((size_t)(0 * NB + b) * NKV + kvh) * NCTX * HD + dl * 8;
-  const half *vp = KV + ((size_t)(1 * NB + b) * NKV + kvh) * NCTX * HD + dl * 8;
+  const half *kp = KV + ((size_t)(0 * NBK + row) * NKV + kvh) * NCTX * HD + dl * 8;
+  const half *vp = KV + ((size_t)(1 * NBK + row) * NKV + kvh) * NCTX * HD + dl * 8;
   for (int kb = k0 + warp * KPW * UNR; kb < k1; kb += MINKEYS) {  // warp-uniform: the shuffles below see every lane
     float kf[UNR][8], vf[UNR][8];
     bool ok[UNR];
@@ -126,9 +128,9 @@ KNAME(float *__restrict__ P, const half *__restrict__ Q, const half *__restrict_
 #endif
 
 #ifdef COMBINE
-// grid (NB * NT * NH), HD threads: warp w merges head dims w*32 .. w*32+31. O: [NB * NT][NH][HD] fp32. params[0] = valid_end.
+// grid (NB * NT * NH), HD threads: warp w merges head dims w*32 .. w*32+31. O: [NB * NT][NH][HD] fp32. params as PARTIAL's.
 extern "C" __global__ void __launch_bounds__(HD) KNAME(float *__restrict__ O, const float *__restrict__ P, const int *__restrict__ params) {
-  const int ns = decode_active_splits(params[0] - NT + 1 + (int)(blockIdx.x / NH) % NT, NSPLIT, MINKEYS), d = threadIdx.x;
+  const int bt = blockIdx.x / NH, ns = decode_active_splits(params[bt / NT] - NT + 1 + bt % NT, NSPLIT, MINKEYS), d = threadIdx.x;
   O[(size_t)blockIdx.x * HD + d] = decode_merge<NSPLIT>(P + (size_t)blockIdx.x * NSPLIT * PSTRIDE, ns, HD, d & 31, d);
 }
 #endif

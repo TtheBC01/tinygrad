@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, cast
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.engine.jit import ScratchPool
-from tinygrad.device import Buffer
+from tinygrad.device import Buffer, BufferSpec
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.amd import RMSNorm, fused_linear, glu_ffn, residual_add
 from tinygrad.llm.kernels.nv import nv_flash_attention
@@ -80,9 +80,13 @@ def apply_rope(x:Tensor, freqs_cis:Tensor, interleaved:bool=False, last:bool=Fal
   x = (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
   return x.rearrange("b h t (two d) -> b h t (d two)", two=2) if interleaved else x
 
-def _update_cache(cache:Tensor, value:Tensor, start_pos:StartPos, dim:int) -> Tensor:
+def _update_cache(cache:Tensor, value:Tensor, start_pos:StartPos, dim:int, rows:tuple[int|UOp, ...]|None=None) -> Tensor:
+  # rows: value's sequence b goes into row rows[b] of a batched cache (dim 0 is the batch)
   def store(c:Tensor, v:Tensor, pos:int|UOp) -> UOp:
     return c.shrink(tuple((pos, pos+v.shape[dim]) if i == dim else None for i in range(c.ndim))).uop.store(v.cast(c.dtype).uop)
+  if rows is not None:
+    assert len(rows) == value.shape[0] and len(start_pos) in (1, len(rows)), "a row per sequence"
+    return Tensor(cache.uop.after(*[store(cache[r:r+1], value[b:b+1], start_pos[b if len(start_pos) > 1 else 0]) for b, r in enumerate(rows)]))
   stores = ([store(cache, value, start_pos[0])] if len(start_pos) == 1 else [store(cache[b:b+1], value[b:b+1], p) for b, p in enumerate(start_pos)])
   return Tensor(cache.uop.after(*stores))
 
@@ -390,24 +394,25 @@ class FFNBlock:
     # a full indexer layer selects the top-k tokens for itself and the shared layers after it (MLATransformerBlock)
     return idx_mask
 
-  def __call__(self, x: Tensor, start_pos: StartPos, idx_mask: Tensor|None=None, tokens: Tensor|None=None):
+  def __call__(self, x: Tensor, start_pos: StartPos, idx_mask: Tensor|None=None, tokens: Tensor|None=None, rows:tuple[int|UOp, ...]|None=None):
+    # rows: x's sequence b is in row rows[b] of batched KV caches (DecodeBatch; TransformerBlock only)
     self._init_state(x)
     if hasattr(self, 'ple'): self.ple._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
-    def _run(x:Tensor, start_pos:StartPos, idx_mask:Tensor|None, tokens:Tensor|None):
+    def _run(x:Tensor, start_pos:StartPos, idx_mask:Tensor|None, tokens:Tensor|None, rows:tuple[int|UOp, ...]|None):
       if hasattr(self, 'ple'): x = x + self.ple(x, start_pos)  # (B, T, hc, D)
       def attend(h:Tensor) -> tuple[Tensor, Tensor|None]:
         h = self.attn_norm(h)
         mask = self._indexer_mask(h, start_pos, idx_mask)
-        return self._attention(h, start_pos, mask), mask
+        return self._attention(h, start_pos, mask, **({} if rows is None else {"rows": rows})), mask
       res_attn = res_ffn = lambda xs, sublayer: (residual_add(xs, (ret:=sublayer(xs))[0]), ret[1])
       if self.config.hc is not None: res_attn, res_ffn = self.hc_attn, self.hc_ffn
       elif self.config.attn_res_block_size: res_attn, res_ffn = self.attn_res_score, self.ffn_res_score
       x, idx_mask = res_attn(x, attend)
       out = res_ffn(x, lambda h: (self._feed_forward(self.ffn_norm(h), tokens), None))[0].contiguous()
       return (out, idx_mask) if idx_mask is not None else out
-    out = _run(x, start_pos, idx_mask, tokens)
+    out = _run(x, start_pos, idx_mask, tokens, rows)
     return out if isinstance(out, tuple) else (out, None)
 
 class TransformerBlock(FFNBlock):
@@ -426,7 +431,7 @@ class TransformerBlock(FFNBlock):
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
     self.indexer = Indexer(config) if config.indexer else None
 
-  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None, rows:tuple[int|UOp, ...]|None=None) -> Tensor:
     q, k, v = fused_linear(x, self.attn_q, self.attn_k, self.attn_v)  # one kernel on NV/CUDA for GGUF quant weights
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
@@ -444,16 +449,19 @@ class TransformerBlock(FFNBlock):
     k = apply_rope(k[..., :self.config.rope_dim], freqs).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
-    assigned_kv = _update_cache(self.cache_kv.transpose(0, 1), Tensor.stack(k, v).transpose(0, 1), start_pos, 3)
+    assigned_kv = _update_cache(self.cache_kv.transpose(0, 1), Tensor.stack(k, v).transpose(0, 1), start_pos, 3, rows)
     # on RDNA3/4, hybrid models use custom flash attention kernels on the KV cache
-    if  idx_mask is None and amd_custom_kernels_supported(x.device) and self.config.ssm is not None and len(start_pos) == 1:
+    if  idx_mask is None and amd_custom_kernels_supported(x.device) and self.config.ssm is not None and len(start_pos) == 1 and rows is None:
       attn = flash_attention(q, assigned_kv.transpose(0, 1), start_pos[0]+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
-    # on NV/CUDA (sm_80+), flash attention on the KV cache (flash decoding for one token), (B,T,H*Hd); None when it doesn't apply
-    if idx_mask is None and len(start_pos) == 1 and not hasattr(self, 'attn_sinks') and not self.config.sliding_window and \
-       (nv_attn:=nv_flash_attention(q, assigned_kv.transpose(0, 1), start_pos[0]+T)) is not None:
+    # on NV/CUDA (sm_80+), flash attention on the KV cache (flash decoding for one token), (B,T,H*Hd); None when it doesn't apply.
+    # Rows with their own positions (batched decode) take flash decoding with a length per row.
+    if idx_mask is None and not hasattr(self, 'attn_sinks') and not self.config.sliding_window and \
+       (nv_attn:=nv_flash_attention(q, assigned_kv.transpose(0, 1), start_pos[0]+T if len(start_pos) == 1 else tuple(p+T for p in start_pos),
+                                    rows)) is not None:
       return self.attn_output(nv_attn if not self.config.attn_output_gate else (nv_attn * gate.sigmoid()))
+    if rows is not None: assigned_kv = Tensor.cat(*(assigned_kv[r:r+1] for r in rows))
     assigned_kv = _cache_prefix(assigned_kv, start_pos, T, 3).transpose(0, 1)
     k, v = assigned_kv[0], assigned_kv[1]
     mask = (idx_mask.repeat_interleave(self.config.n_heads // int(idx_mask.shape[1]), dim=1) if idx_mask is not None else
@@ -474,9 +482,10 @@ class TransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
-      # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0)
-      self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
-                                   dtype=dtypes.half, device=x.device if isinstance(x.device, str) else None)
+      # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0). cache_rows: a
+      # DecodeBatch's slots, else x's batch
+      self.cache_kv = Tensor.zeros(2, getattr(self, "cache_rows", None) or x.shape[0], self.config.n_kv_heads, self.config.max_context,
+                                   self.config.head_dim, dtype=dtypes.half, device=x.device if isinstance(x.device, str) else None)
       if isinstance(x.device, tuple): self.cache_kv = self.cache_kv.shard(x.device, 2).realize()
       # start_pos and T have independent symbolic bounds, the slice can overrun the context by all but one of T
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context + chunk_room(x)-1, self.config.rope_theta,
@@ -844,12 +853,12 @@ class Transformer:
     self.draft:Transformer|None = None
     self.draft_k = 5
 
-  def _trunk(self, tokens:Tensor, start_pos:tuple[int|UOp, ...]) -> Tensor:
+  def _trunk(self, tokens:Tensor, start_pos:tuple[int|UOp, ...], rows:tuple[int|UOp, ...]|None=None) -> Tensor:
     x = self.token_embd(t:=tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     elif self.config.attn_res_block_size: x = x.unsqueeze(2)
     idx_mask = None
-    for block in self.blk: x, idx_mask = block(x, start_pos, idx_mask, t)
+    for block in self.blk: x, idx_mask = block(x, start_pos, idx_mask, t, rows)
     if hc is not None: x = self.output_hc.mix(x)[0] if hasattr(self, 'output_hc') else x.mean(2)
     elif self.config.attn_res_block_size: x = self.output_res_score.mix(x)
     return x
@@ -862,13 +871,17 @@ class Transformer:
     if (jit:=self.verify_jits.get(T:=int(tokens.shape[1]))) is None: jit = self.verify_jits[T] = TinyJit(self.forward_verify, scratch=self.scratch)
     return jit(tokens.contiguous(), start_pos)
 
-  def last_logits(self, tokens:Tensor, *start_pos:int|UOp) -> Tensor:
+  def last_logits(self, tokens:Tensor, *start_pos:int|UOp, rows:tuple[int|UOp, ...]|None=None) -> Tensor:
     # only run the output projection on the last token: (B, T) -> (B, V)
-    return self.output(self.output_norm(self._trunk(tokens, start_pos)[:, -1:]))[:, -1, :].to(tokens.device)
+    return self.output(self.output_norm(self._trunk(tokens, start_pos, rows)[:, -1:]))[:, -1, :].to(tokens.device)
 
   def forward(self, tokens:Tensor, temperature:Tensor, *start_pos:int|UOp) -> Tensor:
-    # a sample from softmax(logits/temp) (the argmax at temperature 0)
+    # a sample from softmax(logits/temp) (the argmax at temperature 0); temperature (1,) or one per row (B, 1)
     return gumbel_sample(self.last_logits(tokens, *start_pos) / temperature.maximum(1e-12)).unsqueeze(-1)
+
+  def forward_rows(self, tokens:Tensor, temperature:Tensor, rows:tuple[UOp, ...], *start_pos:UOp) -> Tensor:
+    # forward for sequences (B, T) in rows of batched KV caches, one position each or one for all (DecodeBatch)
+    return gumbel_sample(self.last_logits(tokens, *start_pos, rows=rows) / temperature.maximum(1e-12)).unsqueeze(-1)
 
   def __call__(self, tokens:Tensor, start_pos:StartPos, temperature:Tensor) -> Tensor:
     assert len(start_pos) in (1, tokens.shape[0]), "expected one shared position or one position per batch row"
@@ -1259,3 +1272,89 @@ class Transformer:
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
+
+def _host_tensor(device:str, n:int, dtype) -> tuple[Tensor, Any]:
+  # an (n,) Tensor in host-visible memory and a memoryview of it: the host writes inputs and reads outputs directly
+  buf = Buffer(device, n * dtype.itemsize, options=BufferSpec(cpu_access=True)).ensure_allocated()
+  return Tensor(UOp.from_buffer(buf, dtype)), unwrap(buf._host_mv()).cast(dtype.fmt)
+
+class DecodeBatch:
+  """Decoding several sequences at once (e.g. a server's concurrent requests) on one model: each sequence holds one of `slots` rows of
+  the KV caches, which the model then allocates with that many rows (so the model takes no other calls). prefill() processes a
+  prompt into a row, reusing the prefix the row already holds, and returns its first token; step() decodes one token for each busy
+  row in one forward, so the weights are read once for all of them (idle rows cost nothing). Llama-style attention blocks only."""
+  def __init__(self, model:Transformer, slots:int):
+    assert slots >= 1 and not model.has_recurrent_block, "batched decode needs a model without recurrent blocks"
+    assert all(type(b) is TransformerBlock and b.indexer is None and not hasattr(b, "ple") and not hasattr(b, "cache_kv") for b in model.blk), \
+      "batched decode needs llama-style attention blocks, on a model that hasn't run yet"
+    for b in model.blk: setattr(b, "cache_rows", slots)
+    self.model, self.slots = model, slots
+    self.cached:list[list[int]] = [[] for _ in range(slots)]  # the tokens whose KV each row holds
+    ctx = model.max_context
+    self.v_slot, self.v_pos = UOp.variable("slot", 0, slots-1), UOp.variable("start_pos", 0, ctx-1)
+    self.v_rows = [UOp.variable(f"row_{i}", 0, slots-1) for i in range(slots)]
+    self.v_poss = [UOp.variable(f"start_pos_{i}", 0, ctx-1) for i in range(slots)]
+    self.prefill_jits:dict[int, Any] = {}  # TinyJit per chunk size
+    self.step_jits:dict[int, Any] = {}  # TinyJit per busy row count
+    # the steps' tokens, temperatures and outputs in host-visible memory: written and read as memory, without a copy program each
+    self.device = dev = cast(str, model.token_embd.weight.device)
+    (self._toks, self._toks_mv), (self._temps, self._temps_mv) = _host_tensor(dev, slots, dtypes.int32), _host_tensor(dev, slots, dtypes.float32)
+    (self._out, self._out_mv) = _host_tensor(dev, slots, dtypes.int32)
+
+  def _run(self, toks:Tensor, temps:Tensor, *rows_and_pos:UOp) -> Tensor:
+    # n sequences: rows_and_pos is their n cache rows, then their n positions. toks is (n, T) (prefill), or the step's host buffer
+    # whose first n are the tokens (slices of it can't be JIT inputs); temps one temperature, or the step's buffer
+    n = len(rows_and_pos) // 2
+    if toks.ndim == 1: toks, temps = toks[:n].reshape(n, 1), temps[:n]
+    out = self.model.forward_rows(toks, temps.reshape(-1, 1), tuple(rows_and_pos[:n]), *rows_and_pos[n:])
+    return self._out[:n].assign(out.flatten().cast(dtypes.int32)).realize()
+
+  def warmup(self):
+    # capture the step JIT for every busy row count and the prefill JIT for every chunk size, then forget what the rows hold
+    for c in self.model._prefill_tiers(None):
+      for _ in range(2):
+        self.cached[0] = []
+        self.prefill(0, [0] * c)
+    for n in range(1, self.slots + 1):
+      outs:list[int|None] = [self.prefill(s, [0]) if s < n else None for s in range(self.slots)]
+      for _ in range(3): outs = self.step(outs)
+    self.cached = [[] for _ in range(self.slots)]
+
+  def prefix_len(self, slot:int, tokens:list[int]) -> int:
+    # how much of tokens the row already holds (all but the last token at most: prefill samples after the last one)
+    return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self.cached[slot])))
+
+  def prefill(self, slot:int, tokens:list[int], temperature:float=0.0) -> int:
+    """Process tokens into row slot (from what it already holds) and return the token after them. The row then holds tokens."""
+    m, start = self.model, self.prefix_len(slot, tokens)
+    assert 0 < len(tokens) < m.max_context, "the prompt must fit the context"
+    t, tiers, temp = m._prompt(tokens), m._prefill_tiers(None), m._temperature(temperature)
+    self.cached[slot] = tokens[:start]
+    while start < len(tokens):
+      n = min(c:=m._chunk(tiers, len(tokens) - start), len(tokens) - start)
+      if (jit:=self.prefill_jits.get(c)) is None: jit = self.prefill_jits[c] = TinyJit(self._run, scratch=m.scratch)
+      sp = self.v_pos.bind(start)
+      jit(t[:, sp:sp+tiers[c].bind(n)], temp, self.v_slot.bind(slot), sp)
+      start += n
+    self.cached[slot] = list(tokens)
+    Device[self.device].synchronize()
+    return self._out_mv[0]
+
+  def step(self, tokens:list[int|None], temperatures:list[float]|None=None) -> list[int|None]:
+    """One token for each busy row r (tokens[r] not None, the row's last sampled token): tokens[r] goes in at position
+    len(cached[r]) and the row's next token is returned (None for idle rows). The caller stops a sequence before it fills the
+    context."""
+    assert len(tokens) == self.slots
+    busy = [r for r, t in enumerate(tokens) if t is not None]
+    if not busy: return [None] * self.slots
+    assert all(len(self.cached[r]) < self.model.max_context for r in busy), "a sequence filled the context"
+    temps = temperatures or [0.0] * self.slots
+    for i, r in enumerate(busy): self._toks_mv[i], self._temps_mv[i] = cast(int, tokens[r]), temps[r]
+    if (jit:=self.step_jits.get(n:=len(busy))) is None: jit = self.step_jits[n] = TinyJit(self._run, scratch=self.model.scratch)
+    jit(self._toks, self._temps, *(v.bind(r) for v, r in zip(self.v_rows, busy)),
+        *(v.bind(len(self.cached[r])) for v, r in zip(self.v_poss, busy)))
+    for r in busy: self.cached[r].append(cast(int, tokens[r]))
+    Device[self.device].synchronize()
+    out:list[int|None] = [None] * self.slots
+    for i, r in enumerate(busy): out[r] = self._out_mv[i]
+    return out

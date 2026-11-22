@@ -5,7 +5,7 @@ from tinygrad.helpers import DEBUG, colored, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, Handler as VizHandler
 if TYPE_CHECKING:
   from tinygrad.llm.tokenizer import SimpleTokenizer
-  from tinygrad.llm.model import Transformer
+  from tinygrad.llm.model import Transformer, DecodeBatch
 
 DSML = "\uff5cDSML\uff5c"  # the DeepSeek tool call tags, between fullwidth bars
 
@@ -199,25 +199,97 @@ class Handler(VizHandler):
     else:
       raise RuntimeError(f"unhandled path {self.path}")
 
+class Running:
+  # a request decoding in one of a DecodeBatch's rows
+  def __init__(self, req:Request, slot:int, first:int, st:float, pt:float):
+    self.req, self.slot, self.last, self.n, self.st, self.pt = req, slot, first, 0, st, pt
+
 class LLMServer(socketserver.ThreadingMixIn, TCPServerWithReuse):
   daemon_threads = True
-  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
-    self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
+               batch:DecodeBatch|None=None):
+    # batch: decode the requests that arrive together as one batch (continuous batching), else one request at a time
+    self.model, self.model_name, self.tok, self.template, self.batch = model, model_name, tok, template, batch
     self.waiting: queue.Queue[Request|None] = queue.Queue()
     super().__init__(server_address, Handler)
 
   def serve_forever(self, poll_interval:float=0.5):
     # inference runs on the caller's thread: BEAM with PARALLEL=0 uses SIGALRM, which only works on the main thread
     threading.Thread(target=super().serve_forever, args=(poll_interval,), daemon=True, name="HTTPServer").start()
+    if self.batch is not None: return self.serve_batched(self.batch)
     while (req := self.waiting.get()) is not None:
       try:
         if req.disconnected(): stderr_log(req.log_prefix + f"{colored('cancelled while queued', 'red')}\n")
         else:
-          for next_id in self.generate(req): req.out.put(next_id)  # TODO: batch decodes across requests (batched_step)
+          for next_id in self.generate(req): req.out.put(next_id)
       except Exception as e:
         traceback.print_exc()
         req.error = e
       req.out.put(None)
+
+  def serve_batched(self, db:DecodeBatch):
+    # continuous batching: new requests are prefilled into free rows between decode steps, then decode with the others; each step
+    # decodes one token for every running request at once
+    running: dict[int, Running] = {}
+    last_used, stopping = [0.0] * db.slots, False
+    while True:
+      while len(running) < db.slots and not stopping:  # admit: wait for a request only when nothing is running
+        try: req = self.waiting.get(block=not running)
+        except queue.Empty: break
+        if req is None:  # shutdown: finish the running requests
+          stopping = True
+          break
+        if req.disconnected():
+          stderr_log(req.log_prefix + f"{colored('cancelled while queued', 'red')}\n")
+          req.out.put(None)
+          continue
+        # the free row holding the longest prefix of the prompt (multi-turn chats), else the least recently used
+        slot = max((s for s in range(db.slots) if s not in running), key=lambda s: (db.prefix_len(s, req.ids), -last_used[s]))
+        req.cached_tokens = db.prefix_len(slot, req.ids)
+        stderr_log(req.log_prefix + f"in:{colored(f'{req.cached_tokens:5d}', 'green')} +{len(req.ids)-req.cached_tokens:5d}  "
+                   f"{colored('--', 'BLACK')}  slot {slot}  {colored('--', 'BLACK')}\n")
+        st = time.perf_counter()
+        try: first = db.prefill(slot, list(req.ids), req.temperature)
+        except Exception as e:
+          traceback.print_exc()
+          req.error = e
+          req.out.put(None)
+          continue
+        run = running[slot] = Running(req, slot, first, st, time.perf_counter())
+        last_used[slot] = run.pt
+        self._emit(db, running, run, first)
+      if not running:
+        if stopping: return
+        continue
+      try: nxt = db.step([running[s].last if s in running else None for s in range(db.slots)],
+                         [running[s].req.temperature if s in running else 0.0 for s in range(db.slots)])
+      except Exception as e:
+        traceback.print_exc()
+        for run in running.values():
+          run.req.error = e
+          run.req.out.put(None)
+        running.clear()
+        continue
+      for s, run in list(running.items()): self._emit(db, running, run, typing.cast(int, nxt[s]))
+
+  def _emit(self, db:DecodeBatch, running:dict[int, Running], run:Running, next_id:int):
+    # a running request's next token: stream it, or finish the request (end token, max_tokens, the context full, disconnected)
+    req, done = run.req, None
+    if self.tok.is_end(next_id): done = "stop"
+    elif req.disconnected(): done = "cancelled"
+    else:
+      req.out.put(next_id)
+      run.last, run.n = next_id, run.n + 1
+      if (req.max_tokens is not None and run.n >= req.max_tokens) or len(db.cached[run.slot]) + 1 >= self.model.max_context: done = "length"
+    if done is None: return
+    if done != "cancelled": req.finish_reason = done
+    del running[run.slot]
+    et = time.perf_counter()
+    total = f"total:{et-run.st:6.2f}s"
+    stderr_log(req.log_prefix + f"slot {run.slot}  {colored('--', 'BLACK')}  prefill:{(len(req.ids)-req.cached_tokens)/(run.pt-run.st):4.0f} tok/s  "
+               f"{colored('--', 'BLACK')}  gen:{run.n/(et-run.pt) if run.n > 1 else 0:4.0f} tok/s  {colored('--', 'BLACK')}  out:{run.n:5d}  "
+               f"{colored('--', 'BLACK')}  {colored(total, 'red') if done == 'cancelled' else total}\n")
+    req.out.put(None)
 
   def shutdown(self):
     # a request queued after the sentinel is never picked up, so its handler thread waits forever. fine since handlers are daemon threads

@@ -15,7 +15,7 @@
 // With NORM, X ([NTOK][K] XTYPE) is the input of an RMSNorm with weight NW ([K] WTYPE) and the values are its output,
 // x * rsqrt(mean(x^2) + NORM_EPS) * WLOAD(w) (WLOAD can round w as the model's weight dtype): each block sums its token's squares
 // itself (re-reading the row from L2).
-// With ATTN, X is flash decoding's partials ([NTOK][K/HD heads][NSPLIT][HD + 2], nv_decode.cu's P) and params[0] its valid_end:
+// With ATTN, X is flash decoding's partials ([NTOK][K/HD heads][NSPLIT][HD + 2], nv_decode.cu's P) and params its per-sequence valid_end:
 // the values are the merged attention output (decode_merge), which is never written out.
 #ifndef XTYPE
 #define XTYPE float
@@ -53,9 +53,9 @@ extern "C" __global__ void __launch_bounds__(128) KNAME(int *__restrict__ XQ, co
 #elif defined(ATTN)
   static_assert(HD % 32 == 0, "a block of 32 values lies in one head");
   const int h = b * 32 / HD;
-  // row t is token t % NT of its sequence, at position valid_end - NT + t % NT
+  // row t is token t % NT of sequence t / NT, at position valid_end - NT + t % NT
   const float v = decode_merge<NSPLIT>(X + ((size_t)t * (K_DIM / HD) + h) * NSPLIT * (HD + 2),
-                                       decode_active_splits(params[0] - NT + 1 + t % NT, NSPLIT, MINKEYS), HD, lane, b * 32 % HD + lane);
+                                       decode_active_splits(params[t / NT] - NT + 1 + t % NT, NSPLIT, MINKEYS), HD, lane, b * 32 % HD + lane);
 #else
   const float v = X[(size_t)t * K_DIM + b * 32 + lane];
 #endif

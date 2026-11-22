@@ -1,11 +1,12 @@
 // Causal flash attention (FlashAttention-2 style) for Ampere (sm_80+) on the LLM's fp16 KV cache, for prefill.
 // O[b, t, h, :] = softmax(Q[b, h, t, :] . K[b, kvh, :valid, :]^T / sqrt(HD), causal) @ V[b, kvh, :valid, :],  kvh = h / (NH / NKV)
-// Q: [NB][NH][TQ][HD] fp16 (TQ = padded query rows), KV: [2][NB][NKV][NCTX][HD] fp16 (K then V, the whole cache),
-// params: {valid_end, q_start} int32 at runtime (keys [0, valid_end) are valid, query row t sits at position q_start + t).
+// Q: [NB][NH][TQ][HD] fp16 (TQ = padded query rows), KV: [2][NBK][NKV][NCTX][HD] fp16 (K then V, the whole cache), sequence b in
+// cache row row0 + b (a slot of a batched cache). params: {valid_end, q_start, row0} int32 at runtime (keys [0, valid_end) are
+// valid, query row t sits at position q_start + t).
 // Query row t attends to keys [0, min(q_start + t + 1, valid_end)). O: [NB][TQ][NH][HD] fp32, so the model's transpose is free.
 // One block = BM = 16*WARPS query rows of one head; each warp owns 16 rows. Keys stream through shared memory BN at a time
 // (STAGES-deep cp.async), S = Q K^T and P V run on mma.sync m16n8k16 with fp32 accumulators, softmax is online in fp32.
-// nv.py prepends nv_common.cuh and #defines KNAME NB NH NKV TQ NCTX HD WARPS BN STAGES.
+// nv.py prepends nv_common.cuh and #defines KNAME NB NBK NH NKV TQ NCTX HD WARPS BN STAGES.
 
 #define NEG_INF __int_as_float(0xff800000)  // -inf (nvrtc --minimal has no math.h INFINITY)
 #define BM (16 * WARPS)
@@ -30,12 +31,12 @@ KNAME(float *__restrict__ O, const half *__restrict__ Q, const half *__restrict_
   half *sK = (half *)smem, *sV = sK + STAGES * BN * HD;  // [STAGES][BN][HD] each; the Q tile borrows the front first
 
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int valid_end = params[0], q_start = params[1];
+  const int valid_end = params[0], q_start = params[1], row0 = params[2];
   // the last query blocks see the most keys: launch them first so they don't form the tail
   const int mb = (TQ / BM - 1) - blockIdx.x, bh = blockIdx.y, b = bh / NH, h = bh % NH, kvh = h / (NH / NKV);
   const half *qg = Q + ((size_t)bh * TQ + mb * BM) * HD;
-  const half *kg = KV + ((size_t)(0 * NB + b) * NKV + kvh) * NCTX * HD;
-  const half *vg = KV + ((size_t)(1 * NB + b) * NKV + kvh) * NCTX * HD;
+  const half *kg = KV + ((size_t)(0 * NBK + row0 + b) * NKV + kvh) * NCTX * HD;
+  const half *vg = KV + ((size_t)(1 * NBK + row0 + b) * NKV + kvh) * NCTX * HD;
 
   // Q tile -> shared -> A fragments in registers, kept for the whole loop
   for (int c = tid; c < BM * HD / 8; c += NTHREADS) cp_async16(sK + sw(c / (HD / 8), c % (HD / 8)), qg + c * 8);

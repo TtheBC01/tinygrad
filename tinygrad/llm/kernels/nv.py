@@ -13,7 +13,7 @@ which needs a small fp32 workspace and a zeroed flag buffer per call.
 Run as a script for a correctness check: DEV=NV python -m tinygrad.llm.kernels.nv
 """
 import ctypes, functools, hashlib, itertools, pathlib
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, cast
 from dataclasses import dataclass
 from tinygrad import Tensor, dtypes, Device, Context
 from tinygrad.dtype import DType
@@ -297,9 +297,9 @@ class FlashCfg:
 
 def _flash_program(O:UOp, Q:UOp, KV:UOp, P:UOp, cfg:FlashCfg) -> UOp:
   NB, TQ, NH, HD = (int(x) for x in O.shape)
-  NKV, NCTX = int(KV.shape[2]), int(KV.shape[3])
-  name = f"nv_flash_attn_{NB}_{NH}_{NKV}_{TQ}_{NCTX}_{HD}_w{cfg.WARPS}_n{cfg.BN}_s{cfg.STAGES}"
-  defines = dict(KNAME=name, NB=NB, NH=NH, NKV=NKV, TQ=TQ, NCTX=NCTX, HD=HD, WARPS=cfg.WARPS, BN=cfg.BN, STAGES=cfg.STAGES)
+  NBK, NKV, NCTX = int(KV.shape[1]), int(KV.shape[2]), int(KV.shape[3])
+  name = f"nv_flash_attn_{NB}{f'of{NBK}' if NBK != NB else ''}_{NH}_{NKV}_{TQ}_{NCTX}_{HD}_w{cfg.WARPS}_n{cfg.BN}_s{cfg.STAGES}"
+  defines = dict(KNAME=name, NB=NB, NBK=NBK, NH=NH, NKV=NKV, TQ=TQ, NCTX=NCTX, HD=HD, WARPS=cfg.WARPS, BN=cfg.BN, STAGES=cfg.STAGES)
   src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + FLASH_SRC
   threads, qblocks, heads = UOp.special(32 * cfg.WARPS, "lidx0"), UOp.special(TQ // (16 * cfg.WARPS), "gidx0"), UOp.special(NB * NH, "gidx1")
   # causal: about half of the TQ x (prefix + TQ) scores; the KV length is only known at runtime, so this counts the chunk itself
@@ -310,8 +310,9 @@ def _flash_program(O:UOp, Q:UOp, KV:UOp, P:UOp, cfg:FlashCfg) -> UOp:
 
 def _int_tensor(x:int|UOp) -> Tensor|None:
   # a symbolic int (sums/products of bound Variables and consts, e.g. start_pos + toks) as a 1-element int32 Tensor
-  if isinstance(x, int): return Tensor([x], dtype=dtypes.int32)
-  if x.op is Ops.CONST: return Tensor([int(x.arg)], dtype=dtypes.int32)
+  # (a scalar const, not Tensor([x]): a list is a host copy in every call)
+  if isinstance(x, int): return Tensor(x, dtype=dtypes.int32).reshape(1)
+  if x.op is Ops.CONST: return Tensor(int(x.arg), dtype=dtypes.int32).reshape(1)
   if x.is_bound_var: return Tensor(x).cast(dtypes.int32).reshape(1)
   if x.op in (Ops.ADD, Ops.MUL) and len(x.src) == 2 and (a:=_int_tensor(x.src[0])) is not None and (b:=_int_tensor(x.src[1])) is not None:
     return a + b if x.op is Ops.ADD else a * b
@@ -321,6 +322,7 @@ def _int_tensor(x:int|UOp) -> Tensor|None:
 class DecodeCfg:
   """Flash decoding's launch shape: NSPLIT blocks per (batch, KV head) of NWARPS warps, each warp issuing UNR steps of loads at once."""
   nb:int
+  nbk:int  # the cache's rows (nb, or a batched cache's slots)
   nt:int  # query tokens per sequence
   nh:int
   nkv:int
@@ -333,12 +335,13 @@ class DecodeCfg:
   def minkeys(self) -> int: return self.nwarps * (32 // (self.hd // 8)) * self.unr  # keys per block step: the fewest a split gets
   @property
   def name(self) -> str:
-    return f"{self.nb}{f'x{self.nt}' if self.nt > 1 else ''}_{self.nh}_{self.nkv}_{self.nctx}_{self.hd}_s{self.nsplit}w{self.nwarps}u{self.unr}"
+    return f"{self.nb}{f'of{self.nbk}' if self.nbk != self.nb else ''}{f'x{self.nt}' if self.nt > 1 else ''}_{self.nh}_{self.nkv}_" \
+           f"{self.nctx}_{self.hd}_s{self.nsplit}w{self.nwarps}u{self.unr}"
 
 def _decode_program(OUT:UOp, *srcs:UOp, stage:str, cfg:DecodeCfg) -> UOp:
   name = f"nv_flash_decode_{stage.lower()}_{cfg.name}"
-  defines = {stage: 1, "KNAME": name, "NB": cfg.nb, "NT": cfg.nt, "NH": cfg.nh, "NKV": cfg.nkv, "NCTX": cfg.nctx, "HD": cfg.hd, "NSPLIT": cfg.nsplit,
-             "NWARPS": cfg.nwarps, "UNR": cfg.unr, "MINKEYS": cfg.minkeys}
+  defines = {stage: 1, "KNAME": name, "NB": cfg.nb, "NBK": cfg.nbk, "NT": cfg.nt, "NH": cfg.nh, "NKV": cfg.nkv, "NCTX": cfg.nctx, "HD": cfg.hd,
+             "NSPLIT": cfg.nsplit, "NWARPS": cfg.nwarps, "UNR": cfg.unr, "MINKEYS": cfg.minkeys}
   src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + DECODE_SRC
   dims:tuple[UOp, ...] = (UOp.special(32 * cfg.nwarps, "lidx0"), UOp.special(cfg.nsplit, "gidx0"), UOp.special(cfg.nb * cfg.nt * cfg.nkv, "gidx1")) \
     if stage == "PARTIAL" else (UOp.special(cfg.hd, "lidx0"), UOp.special(cfg.nb * cfg.nt * cfg.nh, "gidx0"))
@@ -350,16 +353,19 @@ def _decode_program(OUT:UOp, *srcs:UOp, stage:str, cfg:DecodeCfg) -> UOp:
 
 NV_DECODE_MAX_TOKENS = 8  # flash decoding for up to this many query tokens (speculative decoding's check); more go to the flash kernel
 
-def nv_flash_decode(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp, nsms:int) -> Tensor|None:
-  """A few query tokens per sequence: q (B, H, T, D), token t at position valid_end - T + t, over the fp16 cache's keys up to it.
-  (B, T, H * D) fp32, or None."""
+def nv_flash_decode(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp|tuple[int|UOp, ...], nsms:int,
+                    rows:tuple[int|UOp, ...]|None=None) -> Tensor|None:
+  """A few query tokens per sequence: q (B, H, T, D), token t of sequence b at position valid_end[b] - T + t (one valid_end: all of
+  them), over the fp16 cache's keys up to it, sequence b in cache row rows[b] (default b). (B, T, H * D) fp32, or None."""
   B, H, T, D = (int(x) for x in q.shape)
-  KVH, NCTX = int(assigned_kv.shape[2]), int(assigned_kv.shape[3])
-  if (end_t:=_int_tensor(valid_end)) is None: return None
+  NBK, KVH, NCTX = int(assigned_kv.shape[1]), int(assigned_kv.shape[2]), int(assigned_kv.shape[3])
+  ends = valid_end if isinstance(valid_end, tuple) else (valid_end,) * B
+  end_ts, row_ts = [_int_tensor(e) for e in ends], [_int_tensor(r) for r in (rows or tuple(range(B)))]
+  if len(ends) != B or len(row_ts) != B or any(t is None for t in end_ts + row_ts): return None
   # enough blocks to fill the GPU a few times over: each streams its share of the keys
-  cfg = DecodeCfg(B, T, H, KVH, NCTX, D, nsplit=max(1, min(64, -(-getenv("NV_DECODE_BPS", 4) * nsms // (B * T * KVH)))),
+  cfg = DecodeCfg(B, NBK, T, H, KVH, NCTX, D, nsplit=max(1, min(64, -(-getenv("NV_DECODE_BPS", 4) * nsms // (B * T * KVH)))),
                   nwarps=getenv("NV_DECODE_WARPS", 4), unr=getenv("NV_DECODE_UNR", 2))
-  params = end_t.contiguous()
+  params = Tensor.cat(*cast(list[Tensor], end_ts + row_ts)).contiguous()
   part = Tensor.empty(B * T * H * cfg.nsplit * (D + 2), dtype=dtypes.float32, device=q.device)
   part = Tensor.custom_kernel(part, q.transpose(1, 2).cast(dtypes.half).contiguous(), assigned_kv, params,
                               fxn=functools.partial(_decode_program, stage="PARTIAL", cfg=cfg))[0]
@@ -368,19 +374,24 @@ def nv_flash_decode(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp, nsms:int) -
   _note_decode(out, part, params, cfg)
   return out
 
-def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor|None:
-  """Causal attention of q (B, H, T, D) over the fp16 KV cache assigned_kv (2, B, KvH, max_context, D), whose keys [0, valid_end)
-  are valid; query t sits at position valid_end - T + t. Returns (B, T, H * D) fp32 (the heads side by side, as the output
-  projection takes them), or None if the kernel doesn't apply (unsupported device or shapes). One token (decode) uses flash
-  decoding. A symbolic T is padded to its max, and the padding is sliced off."""
+def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp|tuple[int|UOp, ...], rows:tuple[int|UOp, ...]|None=None) -> Tensor|None:
+  """Causal attention of q (B, H, T, D) over the fp16 KV cache assigned_kv (2, Bk, KvH, max_context, D), sequence b in cache row
+  rows[b] (default b; Bk > B: B sequences in a batched cache's slots), whose keys [0, valid_end) are valid; query t sits at position
+  valid_end - T + t. valid_end can be one per sequence (batched decode, flash decoding only). Returns (B, T, H * D) fp32 (the heads
+  side by side, as the output projection takes them), or None if the kernel doesn't apply (unsupported device or shapes). One
+  token (decode) uses flash decoding. A symbolic T is padded to its max, and the padding is sliced off."""
   if not nv_gemm_supported(q.device) or assigned_kv.dtype != dtypes.half or q.ndim != 4 or assigned_kv.ndim != 5: return None
   if q.uop.axis is not None or assigned_kv.uop.axis is not None: return None
   B, H, T, D = q.shape
   _, Bk, KVH, NCTX, Dk = assigned_kv.shape
   if not all(isinstance(v, int) for v in (B, H, D, Bk, KVH, NCTX, Dk)): return None
   B, H, D, KVH, NCTX = int(B), int(H), int(D), int(KVH), int(NCTX)
-  if B != Bk or D != Dk or H % KVH or D not in (64, 128): return None
-  if isinstance(T, int) and T <= NV_DECODE_MAX_TOKENS: return nv_flash_decode(q, assigned_kv, valid_end, num_sms(q.device))
+  if D != Dk or H % KVH or D not in (64, 128) or (rows is None and B != Bk): return None
+  if rows is not None and (len(rows) != B or any((r if isinstance(r, int) else int(r.vmax)) >= int(Bk) for r in rows)): return None
+  if isinstance(T, int) and T <= NV_DECODE_MAX_TOKENS: return nv_flash_decode(q, assigned_kv, valid_end, num_sms(q.device), rows)
+  # the prefill kernel: one valid_end, sequences in consecutive cache rows from row0
+  if isinstance(valid_end, tuple) or (rows is not None and B != 1): return None
+  row0 = 0 if rows is None else rows[0]
   T_max = q.max_shape[2]
   if not isinstance(T_max, int) or T_max < 16: return None  # a few tokens (e.g. speculative decode) stay on tinygrad's kernels
   cfg = FlashCfg(WARPS=4 if T_max >= 64 else 2)
@@ -388,8 +399,8 @@ def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tenso
   if NCTX % cfg.BN or cfg.smem(D) > MAX_SMEM: return None
   TQ = -(-T_max // bm) * bm
   qp = q if isinstance(T, int) and T == TQ else q.pad_to((B, H, T_max, D)).pad((None, None, (0, TQ - T_max), None))
-  if (end_t:=_int_tensor(valid_end)) is None or (start_t:=_int_tensor(valid_end - T)) is None: return None
-  params = end_t.cat(start_t).contiguous()
+  if (end_t:=_int_tensor(valid_end)) is None or (start_t:=_int_tensor(valid_end - T)) is None or (row_t:=_int_tensor(row0)) is None: return None
+  params = end_t.cat(start_t, row_t).contiguous()
   out = Tensor.invalids(B, TQ, H, D, dtype=dtypes.float32, device=q.device)
   out = Tensor.custom_kernel(out, qp.cast(dtypes.half).contiguous(), assigned_kv, params,
                              fxn=functools.partial(_flash_program, cfg=cfg))[0]
