@@ -1,8 +1,9 @@
 from __future__ import annotations
-import enum, functools, itertools, json, math, pathlib, re
+import array, enum, functools, itertools, json, math, pathlib, re
 from dataclasses import dataclass, replace
 from typing import Any, Callable, cast
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
+from tinygrad.device import Buffer
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.amd import RMSNorm, fused_linear, glu_ffn, residual_add
 from tinygrad.llm.kernels.nv import nv_flash_attention
@@ -20,6 +21,13 @@ PREFILL_CHUNK_COST = 64
 @functools.cache
 def _chunk_plan(sizes:tuple[int, ...], left:int) -> tuple[int, int]:  # (cost, first chunk) of the cheapest split of left tokens
   return (0, 0) if left <= 0 else min((PREFILL_CHUNK_COST + c + _chunk_plan(sizes, left - c)[0], c) for c in sizes)
+def _write_host(t:Tensor, vals:list, fmt:str) -> Tensor:
+  # host values into the start of a realized buffer with a plain copy: an eager realize would walk every live Tensor (~10 ms on 8B)
+  if vals:
+    mv = memoryview(array.array(fmt, vals)).cast("B")
+    cast(Buffer, t.uop.base.realized).view(mv.nbytes, 0).ensure_allocated().copy_from(Buffer("NPY", mv.nbytes, opaque=mv).ensure_allocated())
+  return t
+
 def chunk_room(x:Tensor) -> int: return max(int(x.max_shape[1]), PREFILL_CHUNKS[-1])
 
 StartPos = tuple[int|UOp, ...]
@@ -809,7 +817,7 @@ class Transformer:
     self._cached_tokens: list[int] = []
     self._position_count: int|None = None
     # we specialize the JIT for prefill and rollout, and speculative decoding's verification (a static token count)
-    self.prefill_jits:dict[int, Any] = {}  # TinyJit per chunk size (the symbolic token count's max)
+    self.prefill_jits:dict[tuple[int, bool], Any] = {}  # TinyJit per chunk size (the token count's max) and prompt-buffer input
     self.rollout_jit = TinyJit(self.forward)
     self.verify_jits:dict[int, Any] = {}  # TinyJit per token count
     # speculative decoding: with a draft model set, greedy generate() runs generate_speculative with draft_k proposals per round
@@ -846,10 +854,12 @@ class Transformer:
     if self._position_count is None: self._position_count = len(start_pos)
     assert len(start_pos) == self._position_count, "position count is fixed for this model"
     positions = tuple(UOp.variable(f"start_pos_{b}", 0, self.max_context-1).bind(p) if isinstance(p, int) else p for b, p in enumerate(start_pos))
+    # a chunk of generate()'s prompt buffer goes in as a view (contiguous() would realize a copy eagerly), in its own JIT
+    view = (pb:=getattr(self, "_prompt_buf", None)) is not None and tokens.uop.base is pb.uop.base
     if resolve(tokens.shape[1] != 1):
-      if (jit:=self.prefill_jits.get(T:=int(tokens.max_shape[1]))) is None: jit = self.prefill_jits[T] = TinyJit(self.forward)
+      if (jit:=self.prefill_jits.get(key:=(int(tokens.max_shape[1]), view))) is None: jit = self.prefill_jits[key] = TinyJit(self.forward)
     else: jit = self.rollout_jit
-    return jit(tokens.contiguous(), temperature, *positions)
+    return jit(tokens if view else tokens.contiguous(), temperature, *positions)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -1096,6 +1106,19 @@ class Transformer:
         list(zip(range(1), self.generate([0] * c)))
     self._cached_tokens = []
 
+  def _prompt(self, tokens:list[int]) -> Tensor:
+    # the prompt's ids in a persistent (1, max_context) buffer: generate() slices its chunks from it as JIT inputs
+    if (t:=getattr(self, "_prompt_buf", None)) is None:
+      t = self._prompt_buf = Tensor.zeros(1, self.max_context, dtype=dtypes.int32).contiguous().realize()
+    return _write_host(t, tokens[:self.max_context], "i")
+
+  def _temperature(self, temperature:float) -> Tensor:
+    if (t:=getattr(self, "_temp_buf", None)) is None: t = self._temp_buf = Tensor.zeros(1).contiguous().realize()
+    if getattr(self, "_temp_val", None) != temperature:
+      _write_host(t, [temperature], "f")
+      self._temp_val = temperature
+    return t
+
   def _prefill_tiers(self, chunk_size:int|None) -> dict[int, UOp]:
     # chunk size -> its symbolic token count (see PREFILL_CHUNKS); a given chunk_size is the only one
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): sizes:tuple[int, ...] = (1,)
@@ -1134,11 +1157,11 @@ class Transformer:
     next token, so the output is this model's greedy output while its weights are read once per round. Each round stays on the GPU
     (the draft's steps and the check are JITs that pass tokens through device buffers); one readback per round."""
     assert self.max_context <= draft.max_context and not self.has_recurrent_block and not draft.has_recurrent_block and k >= 1
-    temp = Tensor([0.0]).realize()
+    temp = self._temperature(0.0)
     v_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_j, v_i = UOp.variable("spec_j", 0, k), UOp.variable("spec_i", 0, k-1)
     def prefill(m:Transformer, toks:list[int], start:int) -> int:  # process toks[start:], return the next token
-      t = Tensor(toks + [0] * (m.max_context - len(toks)), dtype="int32").reshape(1, m.max_context)
+      t = m._prompt(toks)
       out, tiers = None, m._prefill_tiers(chunk_size)
       while start < len(toks):
         n = min(c:=m._chunk(tiers, len(toks) - start), len(toks) - start)
@@ -1177,9 +1200,9 @@ class Transformer:
     tiers = self._prefill_tiers(chunk_size)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     # TODO: use UOp.variable for temperature once float variables are supported
-    temp = Tensor([temperature])
-    # assign all input tokens once, then slice from start_pos for the model call
-    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+    temp = self._temperature(temperature)
+    # write all input tokens once, then slice from start_pos for the model call
+    t = self._prompt(tokens)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)

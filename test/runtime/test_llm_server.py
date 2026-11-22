@@ -183,6 +183,20 @@ class TestTransformerGenerate(unittest.TestCase):
       return [next(gen) for _ in range(4)]
     self.assertEqual(run(None), run(32))
 
+  def test_prompt_buffer_and_direct_calls(self):
+    # generate() feeds chunks as views of its persistent prompt buffer (no eager copy); a direct call with other tokens gets its
+    # own JIT instead of mismatching the captured one, and gives the same token
+    model = Transformer(TEST_CONFIG)
+    for _ in range(3):
+      model._cached_tokens = []
+      ref = next(model.generate([5, 6, 7, 8]))
+    self.assertIn((32, True), model.prefill_jits)
+    for _ in range(3):
+      t, sp = Tensor([[5, 6, 7, 8] + [0] * 28]).realize(), V_START_POS.bind(0)
+      out = model(t[:, sp:sp+V_TOKS.bind(4)], (sp,), Tensor([0.0])).item()
+    self.assertIn((32, False), model.prefill_jits)
+    self.assertEqual(out, ref)
+
   def test_chunked_prefill_kv_cache_matches_single_chunk(self):
     config = TransformerConfig(num_blocks=1, dim=8, hidden_dim=16, n_heads=1, n_kv_heads=1, norm_eps=1e-5,
       vocab_size=32, head_dim=4, rope_theta=1000000, rope_dim=4, qk_norm=4, v_head_dim=4, max_context=16)
