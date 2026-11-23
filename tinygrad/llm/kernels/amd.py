@@ -1,4 +1,3 @@
-from __future__ import annotations
 import functools, itertools, math
 from typing import Callable, Sequence, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
